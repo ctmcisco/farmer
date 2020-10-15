@@ -21,7 +21,7 @@ let makeSafeApp (environment:string) theLocation storageSku webAppSku =
         setting "public_path" "./public"
         setting "STORAGE_CONNECTIONSTRING" myStorageAccount.Key
 
-        depends_on myStorageAccount.Name
+        depends_on [ myStorageAccount.Name ]
     }
 
     arm {
@@ -34,5 +34,5 @@ let makeSafeApp (environment:string) theLocation storageSku webAppSku =
         output "webAppPassword" myWebApp.PublishingPassword
     }
 
-makeSafeApp "dev" Location.NorthEurope Storage.Standard_LRS Web.Sku.F1
+makeSafeApp "dev" Location.NorthEurope Storage.Standard_LRS WebApp.Sku.F1
 |> Deploy.execute "my-resource-group-name" Deploy.NoParameters

@@ -1,44 +1,78 @@
 [<AutoOpen>]
 module Farmer.Arm.DBforPostgreSQL
 
+open System.Net
 open Farmer
 open Farmer.CoreTypes
 open Farmer.PostgreSQL
 
-type [<RequireQualifiedAccess>] PostgreSQLFamily = Gen5
+let databases = ResourceType ("Microsoft.DBforPostgreSQL/servers/databases", "2017-12-01")
+let firewallRules = ResourceType ("Microsoft.DBforPostgreSQL/servers/firewallrules",  "2017-12-01")
+let servers = ResourceType ("Microsoft.DBforPostgreSQL/servers", "2017-12-01")
 
-type Database =
-    { Name : ResourceName
-      Edition : string
-      Collation : string }
+[<RequireQualifiedAccess>]
+type PostgreSQLFamily =
+    | Gen5
+    override this.ToString() =
+        match this with
+        | Gen5 -> "Gen5"
+    member this.AsArmValue =
+        match this with
+        | Gen5 -> "Gen5"
+
+
+module Servers =
+    type Database =
+        { Name : ResourceName
+          Server : ResourceName
+          Charset : string
+          Collation : string }
+        interface IArmResource with
+            member this.ResourceName = this.Name
+            member this.JsonModel =
+                {|  databases.Create(this.Server/this.Name, dependsOn = [ ResourceId.create this.Server ]) with
+                        properties = {|  charset = this.Charset; collation = this.Collation |}
+                |} :> _
+
+    type FirewallRule =
+        { Name : ResourceName
+          Server : ResourceName
+          Start : IPAddress
+          End : IPAddress
+          Location : Location }
+        interface IArmResource with
+            member this.ResourceName = this.Name
+            member this.JsonModel =
+                {| firewallRules.Create(this.Server/this.Name, this.Location, [ ResourceId.create this.Server ]) with
+                    properties = {| startIpAddress = string this.Start; endIpAddress = string this.End; |}
+                |} :> _
 
 type Server =
-    { ServerName : ResourceName
+    { Name : ResourceName
       Location : Location
-      Username : string
-      Password : SecureParameter
+      Credentials : {| Username : string; Password : SecureParameter |}
       Version : Version
-      Capacity : int
-      StorageSize : int
+      Capacity : int<VCores>
+      StorageSize : int<Mb>
       Tier : Sku
       Family : PostgreSQLFamily
       GeoRedundantBackup : FeatureFlag
       StorageAutoGrow : FeatureFlag
-      BackupRetention : int
-      Databases : Database list }
+      BackupRetention : int<Days>
+      Tags: Map<string,string>  }
 
     member this.Sku =
-        {| name = sprintf "%s_%O_%d" this.Tier.Name this.Family this.Capacity
-           tier = this.Tier.ToString()
+        {| name = sprintf "%s_%s_%d" this.Tier.Name this.Family.AsArmValue this.Capacity
+           tier = string this.Tier
            capacity = this.Capacity
-           family = this.Family.ToString()
-           size = this.StorageSize |}
+           family = string this.Family
+           size = string this.StorageSize |}
 
     member this.GetStorageProfile () = {|
         storageMB = this.StorageSize
         backupRetentionDays = this.BackupRetention
-        geoRedundantBackup = this.GeoRedundantBackup.ToString()
-        storageAutoGrow = this.StorageAutoGrow.ToString()
+        geoRedundantBackup = string this.GeoRedundantBackup
+        storageAutoGrow = string this.StorageAutoGrow
     |}
 
     member this.GetProperties () =
@@ -48,22 +82,19 @@ type Server =
             | VS_9_6 -> "9.6"
             | VS_10 -> "10"
             | VS_11 -> "11"
-        {| administratorLogin = this.Username
-           administratorLoginPassword = this.Password.AsArmRef.Eval()
+
+        {| administratorLogin = this.Credentials.Username
+           administratorLoginPassword = this.Credentials.Password.ArmExpression.Eval()
            version = version
            storageProfile = this.GetStorageProfile() |}
 
     interface IParameters with
-        member this.SecureParameters = [ this.Password ]
+        member this.SecureParameters = [ this.Credentials.Password ]
 
     interface IArmResource with
-        member this.ResourceName = this.ServerName
+        member this.ResourceName = this.Name
         member this.JsonModel =
-            box {| ``type`` = "Microsoft.DBforPostgreSQL/servers"
-                   apiVersion = "2017-12-01"
-                   name = this.ServerName.Value
-                   location = this.Location.ArmValue
-                   tags = {| displayName = this.ServerName.Value |}
-                   sku = this.Sku
-                   properties = this.GetProperties()
-            |}
+            {| servers.Create(this.Name, this.Location, tags = (this.Tags |> Map.add "displayName" this.Name.Value)) with
+                    sku = this.Sku
+                    properties = this.GetProperties()
+            |} :> _

@@ -4,25 +4,10 @@ module Farmer.Builders.ExpressRoute
 open Farmer
 open Farmer.CoreTypes
 open Farmer.ExpressRoute
-open System
 open System.Net
 open Farmer.Arm.Network
 
 /// An IP address block in CIDR notation, such as 10.100.0.0/16.
-type internal IPAddressCidr =
-    {| Address : IPAddress
-       Prefix : int |}
-
-module IPAddressCidr =
-    let parse (s:string) : IPAddressCidr =
-        match s.Split([|'/'|], StringSplitOptions.RemoveEmptyEntries) with
-        [| ip; prefix |] ->
-            {| Address = IPAddress.Parse (ip.Trim ())
-               Prefix = int prefix |}
-        | _ -> raise (ArgumentOutOfRangeException "Malformed CIDR, expecting and IP and prefix separated by '/'")
-    let safeParse (s:string) : Result<IPAddressCidr, Exception> =
-        try parse s |> Ok
-        with ex -> Error ex
 type ExpressRouteCircuitPeering =
     { PeeringType : PeeringType
       AzureASN : int
@@ -55,8 +40,8 @@ type ExpressRouteCircuitPeeringBuilder() =
       { PeeringType = AzurePrivatePeering
         AzureASN = 0
         PeerASN = 0L
-        PrimaryPeerAddressPrefix = {| Address = IPAddress.None; Prefix = 0 |}
-        SecondaryPeerAddressPrefix = {| Address = IPAddress.None; Prefix = 0 |}
+        PrimaryPeerAddressPrefix = { Address = IPAddress.None; Prefix = 0 }
+        SecondaryPeerAddressPrefix = { Address = IPAddress.None; Prefix = 0 }
         SharedKey = None
         VlanId = 0 }
     /// Sets the peering type.
@@ -92,20 +77,22 @@ type ExpressRouteConfig =
     /// Indicates if global reach is enabled on this circuit
     GlobalReachEnabled : bool
     /// Peerings on this circuit
-    Peerings : ExpressRouteCircuitPeeringConfig list }
+    Peerings : ExpressRouteCircuitPeeringConfig list
+    Tags: Map<string,string>  }
 
     interface IBuilder with
-        member exr.BuildResources location _ = [
-            { Name = exr.Name
+        member this.DependencyName = this.Name
+        member this.BuildResources location = [
+            { Name = this.Name
               Location = location
-              Tier = exr.Tier
-              Family = exr.Family
-              ServiceProviderName = exr.ServiceProviderName
-              PeeringLocation = exr.PeeringLocation
-              Bandwidth = exr.Bandwidth
-              GlobalReachEnabled = exr.GlobalReachEnabled
+              Tier = this.Tier
+              Family = this.Family
+              ServiceProviderName = this.ServiceProviderName
+              PeeringLocation = this.PeeringLocation
+              Bandwidth = this.Bandwidth
+              GlobalReachEnabled = this.GlobalReachEnabled
               Peerings = [
-                  for peering in exr.Peerings do
+                  for peering in this.Peerings do
                       {| PeeringType = peering.PeeringType
                          AzureASN = peering.AzureASN
                          PeerASN = peering.PeerASN
@@ -114,6 +101,7 @@ type ExpressRouteConfig =
                          SharedKey = peering.SharedKey
                          VlanId = peering.VlanId |}
               ]
+              Tags = this.Tags
             }
         ]
 
@@ -126,7 +114,8 @@ type ExpressRouteBuilder() =
         PeeringLocation = ""
         Bandwidth = 50<Mbps>
         GlobalReachEnabled = false
-        Peerings = [] }
+        Peerings = [] 
+        Tags = Map.empty}
     /// Sets the name of the circuit
     [<CustomOperation "name">]
     member __.Name(state:ExpressRouteConfig, name) = { state with Name = ResourceName name }
@@ -151,4 +140,10 @@ type ExpressRouteBuilder() =
     /// Enables Global Reach on the circuit
     [<CustomOperation "enable_global_reach">]
     member __.EnableGlobalReach(state:ExpressRouteConfig) = { state with GlobalReachEnabled = true }
+    [<CustomOperation "add_tags">]
+    member _.Tags(state:ExpressRouteConfig, pairs) = 
+        { state with 
+            Tags = pairs |> List.fold (fun map (key,value) -> Map.add key value map) state.Tags }
+    [<CustomOperation "add_tag">]
+    member this.Tag(state:ExpressRouteConfig, key, value) = this.Tags(state, [ (key,value) ])
 let expressRoute = ExpressRouteBuilder()

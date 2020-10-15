@@ -9,8 +9,8 @@ open System
 open Vaults
 
 type NonEmptyList<'T> = 'T * 'T List
-type AccessPolicy =
-    { ObjectId : Guid
+type AccessPolicyConfig =
+    { ObjectId : ArmExpression
       ApplicationId : Guid option
       Permissions :
         {| Keys : Key Set
@@ -19,13 +19,11 @@ type AccessPolicy =
            Storage : Storage Set |}
     }
 type CreateMode =
-    | Recover of NonEmptyList<AccessPolicy>
-    | Default of AccessPolicy list
-    | Unspecified of AccessPolicy list
+    | Recover of NonEmptyList<AccessPolicyConfig>
+    | Default of AccessPolicyConfig list
+    | Unspecified of AccessPolicyConfig list
 
-[<RequireQualifiedAccess>]
-type KeyVaultSku = Standard | Premium
-type KeyVaultSettings =
+type KeyVaultConfigSettings =
     { /// Specifies whether Azure Virtual Machines are permitted to retrieve certificates stored as secrets from the key vault.
       VirtualMachineAccess : FeatureFlag option
       /// Specifies whether Azure Resource Manager is permitted to retrieve secrets from the key vault.
@@ -48,8 +46,8 @@ type SecretConfig =
       Enabled : bool option
       ActivationDate : DateTime option
       ExpirationDate : DateTime option
-      Dependencies : ResourceName list }
-    static member Create key =
+      Dependencies : ResourceId list }
+    static member internal createUnsafe key =
         { Key = key
           Value = ParameterSecret(SecureParameter key)
           ContentType = None
@@ -57,28 +55,53 @@ type SecretConfig =
           ActivationDate = None
           ExpirationDate = None
           Dependencies = [] }
-    static member Create (key, expression, resourceOwner) =
-        { SecretConfig.Create key with
+
+    static member internal isValid key =
+        let charRulesPassed =
+            let charRules = [ Char.IsLetterOrDigit; (=) '-' ]
+            key |> Seq.forall(fun c -> charRules |> Seq.exists(fun r -> r c))
+        let stringRulesPassed =
+            [ (fun l -> String.length l <= 127)
+              String.IsNullOrWhiteSpace >> not ]
+            |> Seq.forall(fun r -> r key)
+
+        if not (charRulesPassed && stringRulesPassed) then
+            failwithf "Key Vault key names must be a 1-127 character string, starting with a letter and containing only 0-9, a-z, A-Z, and -. '%s' is invalid." key
+        else
+            ()
+
+    static member create (key:string) =
+        SecretConfig.isValid key
+        SecretConfig.createUnsafe key
+
+    static member create (key, expression) =
+        { SecretConfig.create key with
             Value = ExpressionSecret expression
-            Dependencies = [ resourceOwner ] }
+            Dependencies =
+                match expression.Owner with
+                | Some owner -> [ owner ]
+                | None -> failwithf "The supplied ARM expression ('%s') has no resource owner. You should explicitly set this using WithOwner(), supplying the Resource Name of the owner." expression.Value
+        }
 
 type KeyVaultConfig =
     { Name : ResourceName
-      TenantId : Guid
-      Access : KeyVaultSettings
-      Sku : KeyVaultSku
+      TenantId : ArmExpression
+      Access : KeyVaultConfigSettings
+      Sku : Sku
       Policies : CreateMode
       NetworkAcl : NetworkAcl
       Uri : Uri option
-      Secrets : SecretConfig list }
-    interface IBuilder with
-        member this.BuildResources location _ = [
+      Secrets : SecretConfig list
+      Dependencies : ResourceId list
+      Tags: Map<string,string>  }
+      interface IBuilder with
+        member this.DependencyName = this.Name
+        member this.BuildResources location = [
             let keyVault =
                 { Name = this.Name
                   Location = location
-                  TenantId = this.TenantId.ToString()
-                  Sku = this.Sku.ToString().ToLower()
-
+                  TenantId = this.TenantId |> ArmExpression.Eval
+                  Sku = this.Sku
                   TemplateDeployment = this.Access.ResourceManagerAccess
                   DiskEncryption = this.Access.AzureDiskEncryptionAccess
                   Deployment = this.Access.VirtualMachineAccess
@@ -108,9 +131,12 @@ type KeyVaultConfig =
                   DefaultAction = this.NetworkAcl.DefaultAction
                   Bypass = this.NetworkAcl.Bypass
                   IpRules = this.NetworkAcl.IpRules
-                  VnetRules = this.NetworkAcl.VnetRules }
+                  VnetRules = this.NetworkAcl.VnetRules
+                  Dependencies = this.Dependencies
+                  Tags = this.Tags }
 
             keyVault
+
             for secret in this.Secrets do
                 { Name = sprintf "%s/%s" this.Name.Value secret.Key |> ResourceName
                   Value = secret.Value
@@ -119,58 +145,84 @@ type KeyVaultConfig =
                   ActivationDate = secret.ActivationDate
                   ExpirationDate = secret.ExpirationDate
                   Location = location
-                  Dependencies = this.Name :: secret.Dependencies }
+                  Dependencies = ResourceId.create this.Name :: secret.Dependencies }
         ]
 
 type AccessPolicyBuilder() =
     member __.Yield _ =
-        { ObjectId = Guid.Empty
+        { ObjectId = ArmExpression.create (string Guid.Empty)
           ApplicationId = None
           Permissions = {| Keys = Set.empty; Secrets = Set.empty; Certificates = Set.empty; Storage = Set.empty |} }
     /// Sets the Object ID of the permission set.
     [<CustomOperation "object_id">]
-    member __.ObjectId(state:AccessPolicy, objectId) = { state with ObjectId = objectId }
-    member __.ObjectId(state:AccessPolicy, objectId) = { state with ObjectId = Guid.Parse objectId }
+    member __.ObjectId(state:AccessPolicyConfig, objectId:ArmExpression) = { state with ObjectId = objectId }
+    member this.ObjectId(state:AccessPolicyConfig, objectId:Guid) = this.ObjectId(state, ArmExpression.create (sprintf "string('%O')" objectId))
+    member this.ObjectId(state:AccessPolicyConfig, (ObjectId objectId)) = this.ObjectId(state, objectId)
+    member this.ObjectId(state:AccessPolicyConfig, objectId:string) = this.ObjectId(state, Guid.Parse objectId)
+    member this.ObjectId(state:AccessPolicyConfig, PrincipalId principalId) = this.ObjectId(state, principalId)
     /// Sets the Application ID of the permission set.
     [<CustomOperation "application_id">]
-    member __.ApplicationId(state:AccessPolicy, applicationId) = { state with ApplicationId = Some applicationId }
+    member __.ApplicationId(state:AccessPolicyConfig, applicationId) = { state with ApplicationId = Some applicationId }
     /// Sets the Key permissions of the permission set.
     [<CustomOperation "key_permissions">]
-    member __.SetKeyPermissions(state:AccessPolicy, permissions) = { state with Permissions = {| state.Permissions with Keys = set permissions |} }
+    member __.SetKeyPermissions(state:AccessPolicyConfig, permissions) = { state with Permissions = {| state.Permissions with Keys = set permissions |} }
     /// Sets the Storage permissions of the permission set.
     [<CustomOperation "storage_permissions">]
-    member __.SetStoragePermissions(state:AccessPolicy, permissions) = { state with Permissions = {| state.Permissions with Storage = set permissions |} }
+    member __.SetStoragePermissions(state:AccessPolicyConfig, permissions) = { state with Permissions = {| state.Permissions with Storage = set permissions |} }
     /// Sets the Secret permissions of the permission set.
     [<CustomOperation "secret_permissions">]
-    member __.SetSecretPermissions(state:AccessPolicy, permissions) = { state with Permissions = {| state.Permissions with Secrets = set permissions |} }
+    member __.SetSecretPermissions(state:AccessPolicyConfig, permissions) = { state with Permissions = {| state.Permissions with Secrets = set permissions |} }
     /// Sets the Certificate permissions of the permission set.
     [<CustomOperation "certificate_permissions">]
-    member __.SetCertificatePermissions(state:AccessPolicy, permissions) = { state with Permissions = {| state.Permissions with Certificates = set permissions |} }
+    member __.SetCertificatePermissions(state:AccessPolicyConfig, permissions) = { state with Permissions = {| state.Permissions with Certificates = set permissions |} }
+
+let accessPolicy = AccessPolicyBuilder()
+type AccessPolicy =
+    /// Quickly creates an access policy for the supplied Principal. If no permissions are supplied, defaults to GET and LIST.
+    static member create (principal:PrincipalId, ?permissions) = accessPolicy { object_id principal; secret_permissions (permissions |> Option.defaultValue Secret.ReadSecrets) }
+    /// Quickly creates an access policy for the supplied ObjectId. If no permissions are supplied, defaults to GET and LIST.
+    static member create (objectId:ObjectId, ?permissions) = accessPolicy { object_id objectId; secret_permissions (permissions |> Option.defaultValue Secret.ReadSecrets) }
+    static member private findEntity (searchField, values, searcher) =
+        values
+        |> Seq.map (sprintf "%s eq '%s'" searchField)
+        |> String.concat " or "
+        |> sprintf "\"%s\""
+        |> searcher
+        |> Result.map (Newtonsoft.Json.JsonConvert.DeserializeObject<{| DisplayName : string; ObjectId : Guid|} array>)
+        |> Result.toOption
+        |> Option.map(Array.map(fun r -> {| r with ObjectId = ObjectId r.ObjectId |}))
+        |> Option.defaultValue Array.empty
+    /// Locates users in Azure Active Directory based on the supplied email addresses.
+    static member findUsers emailAddresses = AccessPolicy.findEntity ("mail", emailAddresses, Deploy.Az.searchUsers)
+    /// Locates groups in Azure Active Directory based on the supplied group names.
+    static member findGroups groupNames = AccessPolicy.findEntity ("displayName", groupNames, Deploy.Az.searchGroups)
 
 [<RequireQualifiedAccess>]
 type SimpleCreateMode = Recover | Default
 type KeyVaultBuilderState =
     { Name : ResourceName
-      Access : KeyVaultSettings
-      Sku : KeyVaultSku
-      TenantId : Guid
+      Access : KeyVaultConfigSettings
+      Sku : Sku
+      TenantId : ArmExpression
       NetworkAcl : NetworkAcl
       CreateMode : SimpleCreateMode option
-      Policies : AccessPolicy list
+      Policies : AccessPolicyConfig list
       Uri : Uri option
-      Secrets : SecretConfig list }
+      Secrets : SecretConfig list
+      Tags: Map<string,string> }
 
 type KeyVaultBuilder() =
     member __.Yield (_:unit) =
         { Name = ResourceName.Empty
-          TenantId = Guid.Empty
-          Access = { VirtualMachineAccess = None; ResourceManagerAccess = None; AzureDiskEncryptionAccess = None; SoftDelete = None }
-          Sku = KeyVaultSku.Standard
+          TenantId = Subscription.TenantId
+          Access = { VirtualMachineAccess = None; ResourceManagerAccess = Some Enabled; AzureDiskEncryptionAccess = None; SoftDelete = None }
+          Sku = Standard
           NetworkAcl = { IpRules = []; VnetRules = []; Bypass = None; DefaultAction = None }
           Policies = []
           CreateMode = None
           Uri = None
-          Secrets = [] }
+          Secrets = []
+          Tags = Map.empty  }
 
     member __.Run(state:KeyVaultBuilderState) : KeyVaultConfig =
         { Name = state.Name
@@ -185,7 +237,12 @@ type KeyVaultBuilder() =
             | Some SimpleCreateMode.Recover, primary :: secondary -> Recover(primary, secondary)
             | Some SimpleCreateMode.Recover, [] -> failwith "Setting the creation mode to Recover requires at least one access policy. Use the accessPolicy builder to create a policy, and add it to the vault configuration using add_access_policy."
           Secrets = state.Secrets
-          Uri = state.Uri }
+          Uri = state.Uri
+          Dependencies =
+            state.Policies
+            |> List.choose(fun r -> r.ObjectId.Owner)
+            |> List.distinct
+          Tags = state.Tags  }
     /// Sets the name of the vault.
     [<CustomOperation "name">]
     member __.Name(state:KeyVaultBuilderState, name) = { state with Name = name }
@@ -196,14 +253,15 @@ type KeyVaultBuilder() =
     /// Sets the Tenant ID of the vault.
     [<CustomOperation "tenant_id">]
     member __.SetTenantId(state:KeyVaultBuilderState, tenantId) = { state with TenantId = tenantId }
-    member __.SetTenantId(state:KeyVaultBuilderState, tenantId) = { state with TenantId = Guid.Parse tenantId }
+    member this.SetTenantId(state:KeyVaultBuilderState, tenantId) = this.SetTenantId(state, ArmExpression.create (sprintf "string('%O')" tenantId))
+    member this.SetTenantId(state:KeyVaultBuilderState, tenantId) = this.SetTenantId(state, Guid.Parse tenantId)
     /// Allows VM access to the vault.
     [<CustomOperation "enable_vm_access">]
     member __.EnableVmAccess(state:KeyVaultBuilderState) = { state with Access = { state.Access with VirtualMachineAccess = Some Enabled } }
     /// Disallows VM access to the vault.
     [<CustomOperation "disable_vm_access">]
     member __.DisableVmAccess(state:KeyVaultBuilderState) = { state with Access = { state.Access with VirtualMachineAccess = Some Disabled } }
-    /// Allows Resource Manager access to the vault.
+    /// Allows Resource Manager access to the vault so that you can deploy secrets during ARM deployments.
     [<CustomOperation "enable_resource_manager_access">]
     member __.EnableResourceManagerAccess(state:KeyVaultBuilderState) = { state with Access = { state.Access with ResourceManagerAccess = Some Enabled } }
     /// Disallows Resource Manager access to the vault.
@@ -232,32 +290,53 @@ type KeyVaultBuilder() =
     member __.DisableRecoveryMode(state:KeyVaultBuilderState) = { state with CreateMode = Some SimpleCreateMode.Default }
     /// Adds an access policy to the vault.
     [<CustomOperation "add_access_policy">]
-    member __.AddAccessPolicy(state:KeyVaultBuilderState, accessPolicy) = { state with Policies = accessPolicy :: state.Policies }
-    // Allows Azure traffic can bypass network rules.
+    member __.AddAccessPolicy(state:KeyVaultBuilderState, accessPolicy) =
+      { state with Policies = accessPolicy :: state.Policies }
+    /// Adds access policies to the vault.
+    [<CustomOperation "add_access_policies">]
+    member __.AddAccessPolicies(state:KeyVaultBuilderState, accessPolicies) =
+      { state with Policies = List.append accessPolicies state.Policies }
+    /// Allows Azure traffic can bypass network rules.
     [<CustomOperation "enable_azure_services_bypass">]
     member __.EnableBypass(state:KeyVaultBuilderState) = { state with NetworkAcl = { state.NetworkAcl with Bypass = Some AzureServices } }
-    // Disallows Azure traffic can bypass network rules.
+    /// Disallows Azure traffic can bypass network rules.
     [<CustomOperation "disable_azure_services_bypass">]
     member __.DisableBypass(state:KeyVaultBuilderState) = { state with NetworkAcl = { state.NetworkAcl with Bypass = Some NoTraffic } }
-    // Allow traffic if no rule from ipRules and virtualNetworkRules match. This is only used after the bypass property has been evaluated.
+    /// Allow traffic if no rule from ipRules and virtualNetworkRules match. This is only used after the bypass property has been evaluated.
     [<CustomOperation "allow_default_traffic">]
     member __.AllowDefaultTraffic(state:KeyVaultBuilderState) = { state with NetworkAcl = { state.NetworkAcl with DefaultAction = Some Allow } }
-    // Deny traffic when no rule from ipRules and virtualNetworkRules match. This is only used after the bypass property has been evaluated.
+    /// Deny traffic when no rule from ipRules and virtualNetworkRules match. This is only used after the bypass property has been evaluated.
     [<CustomOperation "deny_default_traffic">]
     member __.DenyDefaultTraffic(state:KeyVaultBuilderState) = { state with NetworkAcl = { state.NetworkAcl with DefaultAction = Some Deny } }
-    // Adds an IP address rule. This can be an IPv4 address range in CIDR notation, such as '124.56.78.91' (simple IP address) or '124.56.78.0/24' (all addresses that start with 124.56.78).
+    /// Adds an IP address rule. This can be an IPv4 address range in CIDR notation, such as '124.56.78.91' (simple IP address) or '124.56.78.0/24' (all addresses that start with 124.56.78).
     [<CustomOperation "add_ip_rule">]
     member __.AddIpRule(state:KeyVaultBuilderState, ipRule) = { state with NetworkAcl = { state.NetworkAcl with IpRules = ipRule :: state.NetworkAcl.IpRules } }
-    // Adds a virtual network rule. This is the full resource id of a vnet subnet, such as '/subscriptions/subid/resourceGroups/rg1/providers/Microsoft.Network/virtualNetworks/test-vnet/subnets/subnet1'.
+    /// Adds a virtual network rule. This is the full resource id of a vnet subnet, such as '/subscriptions/subid/resourceGroups/rg1/providers/Microsoft.Network/virtualNetworks/test-vnet/subnets/subnet1'.
     [<CustomOperation "add_vnet_rule">]
     member __.AddVnetRule(state:KeyVaultBuilderState, vnetRule) = { state with NetworkAcl = { state.NetworkAcl with VnetRules = vnetRule :: state.NetworkAcl.VnetRules } }
+    /// Allows to add a secret to the vault.
     [<CustomOperation "add_secret">]
-    member __.AddSecret(state:KeyVaultBuilderState, key) = { state with Secrets = SecretConfig.Create key :: state.Secrets }
-    member __.AddSecret(state:KeyVaultBuilderState, (key, value, resourceName)) = { state with Secrets = SecretConfig.Create(key, value, resourceName) :: state.Secrets }
-    member __.AddSecret(state:KeyVaultBuilderState, key) = { state with Secrets = key :: state.Secrets }
+    member __.AddSecret(state:KeyVaultBuilderState, key:SecretConfig) = { state with Secrets = key :: state.Secrets }
+    member this.AddSecret(state:KeyVaultBuilderState, key:string) = this.AddSecret(state, SecretConfig.create key)
+    member this.AddSecret(state:KeyVaultBuilderState, (key, expression:ArmExpression)) = this.AddSecret(state, SecretConfig.create(key, expression))
+
+    /// Allows to add multiple secrets to the vault.
+    [<CustomOperation "add_secrets">]
+    member this.AddSecrets(state:KeyVaultBuilderState, keys) = keys |> Seq.fold(fun state (key:SecretConfig) -> this.AddSecret(state, key)) state
+    member this.AddSecrets(state:KeyVaultBuilderState, keys) = this.AddSecrets(state, keys |> Seq.map SecretConfig.create)
+    member this.AddSecrets(state:KeyVaultBuilderState, items) = this.AddSecrets(state, items |> Seq.map(fun (key, value) -> SecretConfig.create (key, value)))
+    [<CustomOperation "add_tags">]
+    member _.Tags(state:KeyVaultBuilderState, pairs) =
+        { state with
+            Tags = pairs |> List.fold (fun map (key,value) -> Map.add key value map) state.Tags }
+    [<CustomOperation "add_tag">]
+    member this.Tag(state:KeyVaultBuilderState, key, value) = this.Tags(state, [ (key,value) ])
 
 type SecretBuilder() =
-    member __.Yield (_:unit) = SecretConfig.Create ""
+    member __.Run(state:SecretConfig) =
+        SecretConfig.isValid state.Key
+        state
+    member __.Yield (_:unit) = SecretConfig.createUnsafe ""
     [<CustomOperation "name">]
     member __.Name(state:SecretConfig, name) = { state with Key = name; Value = ParameterSecret(SecureParameter name) }
     [<CustomOperation "value">]
@@ -272,9 +351,17 @@ type SecretBuilder() =
     member __.ActivationDate(state:SecretConfig, activationDate) = { state with ActivationDate = Some activationDate }
     [<CustomOperation "expiration_date">]
     member __.ExpirationDate(state:SecretConfig, expirationDate) = { state with ExpirationDate = Some expirationDate }
+
+    member private _.AddDependency (state:SecretConfig, resourceName:ResourceName) = { state with Dependencies = ResourceId.create resourceName :: state.Dependencies }
+    member private _.AddDependencies (state:SecretConfig, resourceNames:ResourceName list) = { state with Dependencies = (resourceNames |> List.map ResourceId.create) @ state.Dependencies }
+    /// Sets a dependency for the web app.
     [<CustomOperation "depends_on">]
-    member __.DependsOn(state:SecretConfig, resourceName) = { state with Dependencies = resourceName :: state.Dependencies }
+    member this.DependsOn(state:SecretConfig, resourceName) = this.AddDependency(state, resourceName)
+    member this.DependsOn(state:SecretConfig, resources) = this.AddDependencies(state, resources)
+    member this.DependsOn(state:SecretConfig, builder:IBuilder) = this.AddDependency(state, builder.DependencyName)
+    member this.DependsOn(state:SecretConfig, builders:IBuilder list) = this.AddDependencies(state, builders |> List.map (fun x -> x.DependencyName))
+    member this.DependsOn(state:SecretConfig, resource:IArmResource) = this.AddDependency(state, resource.ResourceName)
+    member this.DependsOn(state:SecretConfig, resources:IArmResource list) = this.AddDependencies(state, resources |> List.map (fun x -> x.ResourceName))
 
 let secret = SecretBuilder()
-let accessPolicy = AccessPolicyBuilder()
 let keyVault = KeyVaultBuilder()

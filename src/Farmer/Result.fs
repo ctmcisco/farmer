@@ -16,6 +16,12 @@ module Result =
             | Error result -> failures.Add result
         if failures.Count > 0 then Error failures.[0]
         else Ok (successes.ToArray())
+    let ofExn thunk arg =
+        try Ok(thunk arg)
+        with ex -> Error (string ex)
+    // Unsafely unwraps a Result. If the Result is an Error, the Error is cascaded as an exception.
+    let get = function Ok value -> value | Error err -> failwith (err.ToString())
+    let bindError onError = function Error s -> onError s | s -> s
 
     type ResultBuilder() =
         member __.Return(x) = Ok x
@@ -55,3 +61,6 @@ module Result =
 [<AutoOpen>]
 module Builders =
     let result = Result.ResultBuilder()
+    type Result<'TS, 'TE> with
+        /// Unsafely unwraps the Success value out of the Result.
+        member this.OkValue = Result.get this

@@ -6,12 +6,14 @@ open Farmer.CoreTypes
 open Farmer.Redis
 open Farmer.Arm.Cache
 
-let internal buildRedisKey (ResourceName name) =
-    sprintf
-        "concat('%s.redis.cache.windows.net,abortConnect=false,ssl=true,password=', listKeys('%s', '2015-08-01').primaryKey)"
-            name
-            name
-    |> ArmExpression
+let internal buildRedisKey (resourceId:ResourceId) =
+    let resourceId = resourceId.WithType redis
+    let expr =
+        sprintf
+            "concat('%s.redis.cache.windows.net,abortConnect=false,ssl=true,password=', listKeys('%s', '2015-08-01').primaryKey)"
+                resourceId.Name.Value
+                resourceId.Name.Value
+    ArmExpression.create(expr, resourceId)
 
 type RedisConfig =
     { Name : ResourceName
@@ -20,10 +22,12 @@ type RedisConfig =
       RedisConfiguration : Map<string, string>
       NonSslEnabled : bool option
       ShardCount : int option
-      MinimumTlsVersion : TlsVersion option }
-    member this.Key = buildRedisKey this.Name
+      MinimumTlsVersion : TlsVersion option
+      Tags: Map<string,string> }
+    member this.Key = buildRedisKey (ResourceId.create this.Name)
     interface IBuilder with
-        member this.BuildResources location _ = [
+        member this.DependencyName = this.Name
+        member this.BuildResources location = [
             { Name = this.Name
               Location = location
               Sku =
@@ -32,7 +36,8 @@ type RedisConfig =
               RedisConfiguration = this.RedisConfiguration
               NonSslEnabled = this.NonSslEnabled
               ShardCount = this.ShardCount
-              MinimumTlsVersion = this.MinimumTlsVersion }
+              MinimumTlsVersion = this.MinimumTlsVersion
+              Tags = this.Tags }
         ]
 
 type RedisBuilder() =
@@ -43,7 +48,8 @@ type RedisBuilder() =
           RedisConfiguration = Map.empty
           NonSslEnabled = None
           ShardCount = None
-          MinimumTlsVersion = None }
+          MinimumTlsVersion = None
+          Tags = Map.empty }
     member __.Run (state:RedisConfig) =
         { state with
             Capacity =
@@ -86,5 +92,11 @@ type RedisBuilder() =
     member __.ShardCount(state:RedisConfig, shardCount) = { state with ShardCount = Some shardCount }
     [<CustomOperation "minimum_tls_version">]
     member __.MinimumTlsVersion(state:RedisConfig, tlsVersion) = { state with MinimumTlsVersion = Some tlsVersion }
+    [<CustomOperation "add_tags">]
+    member _.Tags(state:RedisConfig, pairs) =
+        { state with
+            Tags = pairs |> List.fold (fun map (key,value) -> Map.add key value map) state.Tags }
+    [<CustomOperation "add_tag">]
+    member this.Tag(state:RedisConfig, key, value) = this.Tags(state, [ (key,value) ])
 
 let redis = RedisBuilder()

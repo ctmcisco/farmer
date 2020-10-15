@@ -4,6 +4,9 @@ module Farmer.Arm.Devices
 open Farmer
 open Farmer.CoreTypes
 
+let iotHubs = ResourceType ("Microsoft.Devices/IotHubs", "2019-03-22")
+let provisioningServices = ResourceType ("Microsoft.Devices/provisioningServices",  "2018-01-22")
+
 type Sku =
 | Free
 | Paid of name:string * units:int
@@ -31,7 +34,7 @@ let serialize (d:DeliveryDetails) =
        lockDurationAsIso8601 = d.LockDuration |> Option.map(fun f -> f.Value) |> Option.toObj
        maxDeliveryCount = d.MaxDeliveryCount |> Option.toNullable |}
 
-type IotHubs =
+type iotHubs =
     { Name : ResourceName
       Location : Location
       Sku : Sku
@@ -40,72 +43,67 @@ type IotHubs =
       DefaultTtl : IsoDateTime option
       MaxDeliveryCount : int option
       Feedback : DeliveryDetails option
-      FileNotifications : DeliveryDetails option }
+      FileNotifications : DeliveryDetails option
+      Tags: Map<string,string>  }
     interface IArmResource with
         member this.ResourceName = this.Name
         member this.JsonModel =
-            {| ``type`` = "Microsoft.Devices/IotHubs"
-               apiVersion = "2019-03-22"
-               name = this.Name.Value
-               location = this.Location.ArmValue
-               properties =
-                {| eventHubEndpoints =
-                    match this.RetentionDays, this.PartitionCount with
-                    | None, None ->
-                        null
-                    | _ ->
-                        box
-                            {| events =
-                                {| retentionTimeInDays = this.RetentionDays |> Option.toNullable
-                                   partitionCount = this.PartitionCount |> Option.toNullable |}
-                            |}
-                   cloudToDevice =
-                    match this with
-                    | { DefaultTtl = None; MaxDeliveryCount = None; Feedback = None } ->
-                        null
-                    | _ ->
-                        box
-                            {| defaultTtlAsIso8601 = this.DefaultTtl |> Option.map(fun v -> v.Value) |> Option.toObj
-                               maxDeliveryCount = this.MaxDeliveryCount |> Option.toNullable
-                               feedback = this.Feedback |> Option.map (serialize >> box) |> Option.toObj |}
-                   messagingEndpoints =
-                    this.FileNotifications
-                    |> Option.map(fun fileNotifications -> box {| fileNotifications = fileNotifications |> serialize |})
-                    |> Option.toObj
-                |}
-               sku =
-                {| name = this.Sku.Name
-                   capacity = this.Sku.Capacity |}
+            {| iotHubs.Create(this.Name, this.Location, tags = this.Tags) with
+                   properties =
+                    {| eventHubEndpoints =
+                        match this.RetentionDays, this.PartitionCount with
+                        | None, None ->
+                            null
+                        | _ ->
+                            box
+                                {| events =
+                                    {| retentionTimeInDays = this.RetentionDays |> Option.toNullable
+                                       partitionCount = this.PartitionCount |> Option.toNullable |}
+                                |}
+                       cloudToDevice =
+                        match this with
+                        | { DefaultTtl = None; MaxDeliveryCount = None; Feedback = None } ->
+                            null
+                        | _ ->
+                            box
+                                {| defaultTtlAsIso8601 = this.DefaultTtl |> Option.map(fun v -> v.Value) |> Option.toObj
+                                   maxDeliveryCount = this.MaxDeliveryCount |> Option.toNullable
+                                   feedback = this.Feedback |> Option.map (serialize >> box) |> Option.toObj |}
+                       messagingEndpoints =
+                        this.FileNotifications
+                        |> Option.map(fun fileNotifications -> box {| fileNotifications = fileNotifications |> serialize |})
+                        |> Option.toObj
+                    |}
+                   sku =
+                    {| name = this.Sku.Name
+                       capacity = this.Sku.Capacity |}
             |} :> _
 
 type ProvisioningServices =
     { Name : ResourceName
       Location : Location
       IotHubName : ResourceName
-      IotHubKey : ArmExpression }
+      IotHubKey : ArmExpression
+      Tags: Map<string,string>  }
     member this.IotHubConnection =
         sprintf "concat('HostName=%s.azure-devices.net;SharedAccessKeyName=iothubowner;SharedAccessKey=',%s)"
             this.IotHubName.Value
             this.IotHubKey.Value
-        |> ArmExpression
+        |> ArmExpression.create
     member this.IotHubPath =
         sprintf "%s.azure-devices.net" this.IotHubName.Value
     interface IArmResource with
         member this.ResourceName = this.Name
         member this.JsonModel =
-            {| ``type`` = "Microsoft.Devices/provisioningServices"
-               sku =
-                 {| name = "S1"
-                    capacity = 1 |}
-               name = this.Name.Value
-               apiVersion = "2018-01-22"
-               location = this.Location.ArmValue
-               properties =
-                 {| iotHubs = [
-                       {| connectionString = this.IotHubConnection.Eval()
-                          location = this.Location.ArmValue
-                          name = this.IotHubPath |}
-                   ]
-                 |}
-               dependsOn = [ this.IotHubName.Value ]
+            {| provisioningServices.Create(this.Name, this.Location, [ ResourceId.create this.IotHubName ], this.Tags) with
+                   sku =
+                     {| name = "S1"
+                        capacity = 1 |}
+                   properties =
+                     {| iotHubs = [
+                           {| connectionString = this.IotHubConnection.Eval()
+                              location = this.Location.ArmValue
+                              name = this.IotHubPath |}
+                       ]
+                     |}
             |} :> _

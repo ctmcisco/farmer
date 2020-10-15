@@ -104,7 +104,7 @@ let tests = testList "Template" [
 
     test "Secure parameter is correctly added" {
         let template = arm {
-            add_resource (vm { name "isaacvm" })
+            add_resource (vm { name "isaacvm"; username "foo" })
         }
         Expect.sequenceEqual template.Template.Parameters [ SecureParameter "password-for-isaacvm" ] "Missing parameter for VM."
     }
@@ -116,5 +116,85 @@ let tests = testList "Template" [
             output "bar" "bop"
         }
         Expect.sequenceEqual template.Template.Outputs [ "bar", "bop"; "foo", "baz" ] "Outputs should work like a key/value store"
+    }
+
+    test "Can add a list of resources types together" {
+        let resources : IBuilder list = [
+            storageAccount { name "test" }
+            storageAccount { name "test2" }
+        ]
+        let template = arm {
+            add_resources resources
+        }
+        Expect.hasLength template.Template.Resources 2 "Should be two resources added"
+    }
+
+    test "Can add dependency through Resource Name" {
+        let a = storageAccount { name "aaa" }
+        let b = webApp { name "b"; depends_on a.Name.ResourceName }
+
+        Expect.equal b.Dependencies [ ResourceId.create (ResourceName "aaa") ] "Dependency should have been set"
+    }
+
+    test "Can add dependency through IBuilder" {
+        let a = storageAccount { name "aaa" }
+        let b = webApp { name "b"; depends_on a }
+
+        Expect.equal b.Dependencies [ ResourceId.create (ResourceName "aaa") ] "Dependency should have been set"
+    }
+
+    test "Can add dependencies through Resource Name" {
+        let a = storageAccount { name "aaa" }
+        let b = storageAccount { name "bbb" }
+        let b = webApp { name "b"; depends_on [ a.Name.ResourceName; b.Name.ResourceName ] }
+
+        Expect.equal b.Dependencies [ ResourceId.create (ResourceName "aaa"); ResourceId.create (ResourceName "bbb") ] "Dependencies should have been set"
+    }
+
+    test "Can add dependencies through IBuilder" {
+        let a = storageAccount { name "aaa" }
+        let b = storageAccount { name "bbb" }
+        let b = webApp { name "b"; depends_on [ a :> IBuilder; b :> IBuilder ] }
+
+        Expect.equal b.Dependencies [ ResourceId.create (ResourceName "aaa"); ResourceId.create (ResourceName "bbb") ] "Dependencies should have been set"
+    }
+
+    test "Generates untyped Resource Id" {
+        let rid = ResourceId.create (ResourceName "test")
+        let id = rid.Eval()
+        Expect.equal id "[string('test')]" "resourceId template function should match"
+    }
+
+    test "Generates typed Resource Id" {
+        let rid = ResourceId.create (Arm.Network.connections, ResourceName "test")
+        let id = rid.Eval()
+        Expect.equal id "[resourceId('Microsoft.Network/connections', 'test')]" "resourceId template function should match"
+    }
+
+    test "Generates typed Resource Id with group" {
+        let rid = ResourceId.create (Arm.Network.connections, ResourceName "test", "myGroup")
+        let id = rid.Eval()
+        Expect.equal id "[resourceId('myGroup', 'Microsoft.Network/connections', 'test')]" "resourceId template function should match"
+    }
+
+    test "Generates typed Resource Id with segments" {
+        let rid = ResourceId.create (Arm.Network.connections, ResourceName "test", ResourceName "segment1", ResourceName "segment2")
+        let id = rid.Eval()
+        Expect.equal id "[resourceId('Microsoft.Network/connections', 'test', 'segment1', 'segment2')]" "resourceId template function should match"
+    }
+
+    test "Fails if ARM expression is already quoted" {
+        Expect.throws(fun () -> ArmExpression.create "[test]" |> ignore ) "Should fail on quoted ARM expression"
+    }
+
+    test "Does not fail if ARM expression contains an inner quote" {
+        Expect.equal "[foo[test]]" ((ArmExpression.create "foo[test]").Eval()) "Failed on quoted ARM expression"
+    }
+    test "Does not create empty nodes for core resource fields when nothing is supplied" {
+        let createdResource = ResourceType("Test", "2017-01-01").Create(ResourceName "Name")
+        Expect.equal
+            createdResource
+            {| name = "Name"; ``type`` = "Test"; apiVersion = "2017-01-01"; dependsOn = null; location = null; tags = null |}
+            "Default values don't match"
     }
 ]

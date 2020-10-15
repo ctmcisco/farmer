@@ -6,115 +6,197 @@ open Farmer.CoreTypes
 open Farmer.Sql
 open Farmer.Arm.Sql
 open System.Net
+open Servers
+open Databases
+
+type SqlAzureDbConfig =
+    { Name : ResourceName
+      Sku : DbPurchaseModel option
+      MaxSize : int<Mb> option
+      Collation : string
+      Encryption : FeatureFlag }
 
 type SqlAzureConfig =
-    { ServerName : ResourceRef
+    { Name : ResourceName
       AdministratorCredentials : {| UserName : string; Password : SecureParameter |}
-      Name : ResourceName
-      DbEdition : Sku
-      DbCollation : string
-      Encryption : FeatureFlag
-      FirewallRules : {| Name : string; Start : IPAddress; End : IPAddress |} list }
-    /// Gets the ARM expression path to the FQDN of this VM.
-    member this.FullyQualifiedDomainName =
-        sprintf "reference(concat('Microsoft.Sql/servers/', variables('%s'))).fullyQualifiedDomainName" this.ServerName.ResourceName.Value
-        |> ArmExpression
+      FirewallRules : {| Name : ResourceName; Start : IPAddress; End : IPAddress |} list
+      ElasticPoolSettings :
+        {| Name : ResourceName option
+           Sku : PoolSku
+           PerDbLimits : {| Min: int<DTU>; Max : int<DTU> |} option
+           Capacity : int<Mb> option |}
+      Databases : SqlAzureDbConfig list
+      Tags: Map<string,string>  }
     /// Gets a basic .NET connection string using the administrator username / password.
-    member this.ConnectionString =
-        concat
-            [ literal
-                (sprintf "Server=tcp:%s.database.windows.net,1433;Initial Catalog=%s;Persist Security Info=False;User ID=%s;Password="
-                    this.ServerName.ResourceName.Value
-                    this.Name.Value
-                    this.AdministratorCredentials.UserName)
-              this.AdministratorCredentials.Password.AsArmRef
-              literal ";MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;" ]
-    member this.Server =
-        this.ServerName.ResourceName
-    interface IBuilder with
-        member this.BuildResources location resources = [
-            let database =
-                {| Name = this.Name
-                   Sku = this.DbEdition
-                   Collation = this.DbCollation
-                   TransparentDataEncryption = this.Encryption |}
+    member this.ConnectionString (database:SqlAzureDbConfig) =
+        let expr =
+            ArmExpression.concat [
+                ArmExpression.literal
+                    (sprintf "Server=tcp:%s.database.windows.net,1433;Initial Catalog=%s;Persist Security Info=False;User ID=%s;Password="
+                        this.Name.Value
+                        database.Name.Value
+                        this.AdministratorCredentials.UserName)
+                this.AdministratorCredentials.Password.ArmExpression
+                ArmExpression.literal ";MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;"
+            ]
+        expr.WithOwner (ResourceId.create(databases, database.Name))
+    member this.ConnectionString databaseName =
+        this.Databases
+        |> List.tryFind(fun db -> db.Name = databaseName)
+        |> Option.map this.ConnectionString
+        |> Option.defaultWith(fun _ -> failwithf "Unknown database name %s" databaseName.Value)
+    member this.ConnectionString databaseName = this.ConnectionString (ResourceName databaseName)
 
-            match this.ServerName with
-            | AutomaticallyCreated serverName ->
-                { ServerName = serverName
+    interface IBuilder with
+        member this.DependencyName = this.Name
+        member this.BuildResources location = [
+            let elasticPoolName =
+                this.ElasticPoolSettings.Name
+                |> Option.defaultValue (this.Name.Map (sprintf "%s-pool"))
+
+            { ServerName = this.Name
+              Location = location
+              Credentials =
+                {| Username = this.AdministratorCredentials.UserName
+                   Password = this.AdministratorCredentials.Password |}
+              Tags = this.Tags
+            }
+
+            for database in this.Databases do
+                { Name = database.Name
+                  Server = this.Name
                   Location = location
-                  Credentials =
-                    {| Username = this.AdministratorCredentials.UserName
-                       Password = this.AdministratorCredentials.Password |}
-                  FirewallRules = this.FirewallRules
-                  Databases = [ database ] }
-            | External serverName ->
-                resources
-                |> Helpers.mergeResource serverName (fun server -> { server with Databases = database :: server.Databases })
-            | AutomaticPlaceholder ->
-                failwith "SQL Server Name has not been set."
+                  MaxSizeBytes =
+                    match database.Sku, database.MaxSize with
+                    | Some _, Some maxSize -> Some (Mb.toBytes maxSize)
+                    | _ -> None
+                  Sku =
+                   match database.Sku with
+                   | Some dbSku -> Standalone dbSku
+                   | None -> Pool elasticPoolName
+                  Collation = database.Collation }
+
+                match database.Encryption with
+                | Enabled ->
+                  { Server = this.Name
+                    Database = database.Name }
+                | Disabled ->
+                  ()
+
+            for rule in this.FirewallRules do
+                { Name = rule.Name
+                  Start = rule.Start
+                  End = rule.End
+                  Location = location
+                  Server = this.Name }
+
+            if this.Databases |> List.exists(fun db -> db.Sku.IsNone) then
+                { Name = elasticPoolName
+                  Server = this.Name
+                  Location = location
+                  Sku = this.ElasticPoolSettings.Sku
+                  MaxSizeBytes = this.ElasticPoolSettings.Capacity |> Option.map Mb.toBytes
+                  MinMax = this.ElasticPoolSettings.PerDbLimits |> Option.map(fun l -> l.Min, l.Max) }
         ]
 
-type SqlBuilder() =
-    let makeIp = IPAddress.Parse
-    member __.Yield _ =
-        { ServerName = AutomaticPlaceholder
-          AdministratorCredentials = {| UserName = ""; Password = SecureParameter "" |}
-          Name = ResourceName ""
-          DbEdition = Free
-          DbCollation = "SQL_Latin1_General_CP1_CI_AS"
-          Encryption = Disabled
-          FirewallRules = [] }
-    member __.Run(state) =
-        { state with
-            ServerName =
-                match state.ServerName with
-                | External x -> External(x |> Helpers.sanitiseDb |> ResourceName)
-                | AutomaticallyCreated x -> AutomaticallyCreated(x |> Helpers.sanitiseDb |> ResourceName)
-                | AutomaticPlaceholder -> failwith "You must specific a server name, or link to an existing server."
-            Name = state.Name |> Helpers.sanitiseDb |> ResourceName
-            AdministratorCredentials =
-                match state.ServerName with
-                | External _ -> state.AdministratorCredentials
-                | AutomaticallyCreated _
-                | AutomaticPlaceholder ->
-                    if System.String.IsNullOrWhiteSpace state.AdministratorCredentials.UserName then failwith "You must specific an admin_username."
-                    {| state.AdministratorCredentials with
-                        Password = SecureParameter (sprintf "password-for-%s" state.ServerName.ResourceName.Value) |} }
-    [<CustomOperation "server_name">]
-    /// Sets the name of the SQL server.
-    member __.ServerName(state:SqlAzureConfig, serverName) = { state with ServerName = AutomaticallyCreated serverName }
-    member this.ServerName(state:SqlAzureConfig, serverName:string) = this.ServerName(state, ResourceName serverName)
-    [<CustomOperation "link_to_server">]
-    /// Sets the name of the SQL server.
-    member __.LinkToServerName(state:SqlAzureConfig, serverName) = { state with ServerName = External serverName }
-    member this.LinkToServerName(state:SqlAzureConfig, serverName) = this.LinkToServerName(state, ResourceName serverName)
+type SqlDbBuilder() =
+    member _.Yield _ =
+        { Name = ResourceName ""
+          Collation = "SQL_Latin1_General_CP1_CI_AS"
+          Sku = None
+          MaxSize = None
+          Encryption = Disabled }
     /// Sets the name of the database.
     [<CustomOperation "name">]
-    member __.Name(state:SqlAzureConfig, name) = { state with Name = name }
-    member this.Name(state:SqlAzureConfig, name:string) = this.Name(state, ResourceName name)
-    /// Sets the sku of the database.
+    member _.DbName(state:SqlAzureDbConfig, name) = { state with Name = name }
+    member this.DbName(state:SqlAzureDbConfig, name:string) = this.DbName(state, ResourceName name)
+    /// Sets the sku of the database
     [<CustomOperation "sku">]
-    member __.DatabaseEdition(state:SqlAzureConfig, edition:Sku) = { state with DbEdition = edition }
+    member _.DbSku(state:SqlAzureDbConfig, sku:DtuSku) = { state with Sku = Some (DTU sku) }
+    member _.DbSku(state:SqlAzureDbConfig, sku:MSeries) = { state with Sku = Some (VCore(MemoryIntensive sku, LicenseRequired)) }
+    member _.DbSku(state:SqlAzureDbConfig, sku:FSeries) = { state with Sku = Some (VCore(CpuIntensive sku, LicenseRequired)) }
+    member _.DbSku(state:SqlAzureDbConfig, sku:VCoreSku) = { state with Sku = Some (VCore (sku, LicenseRequired)) }
     /// Sets the collation of the database.
     [<CustomOperation "collation">]
-    member __.Collation(state:SqlAzureConfig, collation:string) = { state with DbCollation = collation }
+    member _.DbCollation(state:SqlAzureDbConfig, collation:string) = { state with Collation = collation }
+    /// States that you already have a SQL license and qualify for Azure Hybrid Benefit discount.
+    [<CustomOperation "hybrid_benefit">]
+    member _.ZoneRedundant(state:SqlAzureDbConfig) =
+        { state with
+            Sku =
+                match state.Sku with
+                | Some (VCore (v, _)) ->
+                    Some (VCore (v, AzureHybridBenefit))
+                | Some (DTU _)
+                | None ->
+                    failwith "You can only set licensing on VCore databases. Ensure that you have already set the SKU to a VCore model."
+        }
+    /// Sets the maximum size of the database, if this database is not part of an elastic pool.
+    [<CustomOperation "db_size">]
+    member _.MaxSize(state:SqlAzureDbConfig, size:int<Mb>) = { state with MaxSize = Some size }
     /// Enables encryption of the database.
     [<CustomOperation "use_encryption">]
-    member __.Encryption(state:SqlAzureConfig) = { state with Encryption = Enabled }
+    member _.UseEncryption(state:SqlAzureDbConfig) = { state with Encryption = Enabled }
     /// Adds a custom firewall rule given a name, start and end IP address range.
+    member _.Run (state:SqlAzureDbConfig) =
+        if state.Name = ResourceName.Empty then failwith "You must set a database name."
+        state
+
+type SqlServerBuilder() =
+    let makeIp = IPAddress.Parse
+    member __.Yield _ =
+        { Name = ResourceName ""
+          AdministratorCredentials = {| UserName = ""; Password = SecureParameter "" |}
+          ElasticPoolSettings =
+            {| Name = None
+               Sku = PoolSku.Basic50
+               PerDbLimits = None
+               Capacity = None |}
+          Databases = []
+          FirewallRules = []
+          Tags = Map.empty  }
+    member __.Run(state) : SqlAzureConfig =
+        { state with
+            Name =
+                if state.Name = ResourceName.Empty then failwith "You must set a server name"
+                else state.Name |> Helpers.sanitiseDb |> ResourceName
+            AdministratorCredentials =
+                if System.String.IsNullOrWhiteSpace state.AdministratorCredentials.UserName then failwithf "You must specify the admin_username for SQL Server instance %s" state.Name.Value
+                {| state.AdministratorCredentials with
+                    Password = SecureParameter (sprintf "password-for-%s" state.Name.Value) |} }
+    /// Sets the name of the SQL server.
+    [<CustomOperation "name">]
+    member _.ServerName(state:SqlAzureConfig, serverName) = { state with Name = serverName }
+    member this.ServerName(state:SqlAzureConfig, serverName:string) = this.ServerName(state, ResourceName serverName)
+    /// Sets the name of the elastic pool. If not set, the name will be generated based off the server name.
+    [<CustomOperation "elastic_pool_name">]
+    member _.Name(state:SqlAzureConfig, name) = { state with ElasticPoolSettings = {| state.ElasticPoolSettings with Name = Some name |} }
+    member this.Name(state, name) = this.Name(state, ResourceName name)
+    /// Sets the sku of the server, to be shared on all databases that do not have an explicit sku set.
+    [<CustomOperation "elastic_pool_sku">]
+    member _.Sku(state:SqlAzureConfig, sku) = { state with ElasticPoolSettings = {| state.ElasticPoolSettings with Sku = sku |} }
+    /// The per-database min and max DTUs to allocate.
+    [<CustomOperation "elastic_pool_database_min_max">]
+    member _.PerDbLimits(state:SqlAzureConfig, min, max) = { state with ElasticPoolSettings = {| state.ElasticPoolSettings with PerDbLimits = Some {| Min = min; Max = max |} |} }
+    /// The per-database min and max DTUs to allocate.
+    [<CustomOperation "elastic_pool_capacity">]
+    member _.PoolCapacity(state:SqlAzureConfig, capacity) = { state with ElasticPoolSettings = {| state.ElasticPoolSettings with Capacity = Some capacity |} }
+    /// The per-database min and max DTUs to allocate.
+    [<CustomOperation "add_databases">]
+    member _.AddDatabases(state:SqlAzureConfig, databases) = { state with Databases = state.Databases @ databases }
+    /// Adds a firewall rule that enables access to a specific IP Address range.
     [<CustomOperation "add_firewall_rule">]
-    member __.AddFirewallWall(state:SqlAzureConfig, name, startRange, endRange) =
+    member __.AddFirewallRule(state:SqlAzureConfig, name, startRange, endRange) =
         { state with
             FirewallRules =
-                {| Name = name
+                {| Name = ResourceName name
                    Start = makeIp startRange
                    End = makeIp endRange |}
                 :: state.FirewallRules }
     /// Adds a firewall rule that enables access to other Azure services.
     [<CustomOperation "enable_azure_firewall">]
     member this.UseAzureFirewall(state:SqlAzureConfig) =
-        this.AddFirewallWall(state, "Allow Azure services", "0.0.0.0", "0.0.0.0")
+        this.AddFirewallRule(state, "allow-azure-services", "0.0.0.0", "0.0.0.0")
     /// Sets the admin username of the server (note: the password is supplied as a securestring parameter to the generated ARM template).
     [<CustomOperation "admin_username">]
     member __.AdminUsername(state:SqlAzureConfig, username) =
@@ -122,13 +204,11 @@ type SqlBuilder() =
             AdministratorCredentials =
                 {| state.AdministratorCredentials with
                     UserName = username |} }
-
-open WebApp
-type WebAppBuilder with
-    member this.DependsOn(state:WebAppConfig, sqlDb:SqlAzureConfig) =
-        this.DependsOn(state, sqlDb.ServerName.ResourceName)
-type FunctionsBuilder with
-    member this.DependsOn(state:FunctionsConfig, sqlDb:SqlAzureConfig) =
-        this.DependsOn(state, sqlDb.ServerName.ResourceName)
-
-let sql = SqlBuilder()
+    [<CustomOperation "add_tags">]
+    member _.Tags(state:SqlAzureConfig, pairs) =
+        { state with
+            Tags = pairs |> List.fold (fun map (key,value) -> Map.add key value map) state.Tags }
+    [<CustomOperation "add_tag">]
+    member this.Tag(state:SqlAzureConfig, key, value) = this.Tags(state, [ (key,value) ])
+let sqlServer = SqlServerBuilder()
+let sqlDb = SqlDbBuilder()

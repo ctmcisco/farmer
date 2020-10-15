@@ -19,7 +19,10 @@ module Az =
     open System.Runtime.InteropServices
     open System.Text
 
-    let MinimumVersion = Version "2.3.1"
+    let MinimumVersion = Version "2.5.0"
+
+    type AzureCLIToolsNotFound (message:string, innerException : exn) =
+        inherit System.Exception (message, innerException)  
 
     [<AutoOpen>]
     module AzHelpers =
@@ -39,25 +42,33 @@ module Az =
                 | _ ->
                     failwithf "OSPlatform: %s not supported" RuntimeInformation.OSDescription
         let executeAz arguments =
-            let azProcess =
-                ProcessStartInfo(
-                    FileName = azCliPath.Value,
-                    Arguments = arguments,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true)
-                |> Process.Start
-            let sb = StringBuilder()
-            let flushContents() =
-                let flushStream (stream:StreamReader) =
-                    while not stream.EndOfStream do sb.AppendLine(stream.ReadLine()) |> ignore
-                [ azProcess.StandardOutput; azProcess.StandardError ] |> List.iter flushStream
+            try
+                let azProcess =
+                    ProcessStartInfo(
+                        FileName = azCliPath.Value,
+                        Arguments = arguments,
+                        UseShellExecute = false,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true)
+                    |> Process.Start
+                let sb = StringBuilder()
+                let flushContents() =
+                    let flushStream (stream:StreamReader) =
+                        while not stream.EndOfStream do sb.AppendLine(stream.ReadLine()) |> ignore
+                    [ azProcess.StandardOutput; azProcess.StandardError ] |> List.iter flushStream
 
-            flushContents() // For some reason if we don't try flushing before waiting for exit, sometimes stdout crashes.
-            azProcess.WaitForExit()
-            flushContents()
+                flushContents() // For some reason if we don't try flushing before waiting for exit, sometimes stdout crashes.
+                azProcess.WaitForExit()
+                flushContents()
+                azProcess, sb.ToString()
+            with 
+            | :? System.ComponentModel.Win32Exception as e when e.Message.Contains("No such file or directory") ->
+                let message = sprintf "Could not find Azure CLI tools on %s. Make sure you've setup the Azure CLI tools.  Go to https://compositionalit.github.io/farmer/quickstarts/quickstart-3/#install-the-azure-cli for more information." azCliPath.Value
+                AzureCLIToolsNotFound(message, e) |> raise
+            | _ -> 
+                reraise()
 
-            azProcess, sb.ToString()
+            
         let processToResult (p:Process, response) =
             match p.ExitCode with
             | 0 -> Ok response
@@ -66,7 +77,7 @@ module Az =
     /// Executes a generic AZ CLI command.
     let az = AzHelpers.executeAz >> processToResult
     /// Tests if the Az CLI has logged in credentials.
-    let isLoggedIn() = az "account show" |> function Ok _ -> true | Error _ -> false
+    let showAccount() = az "account show"
     /// Logs you into Az CLI interactively.
     let login() = az "login" |> Result.ignore
     /// Logs you into the Az CLI using the supplied service principal credentials.
@@ -76,8 +87,12 @@ module Az =
     let listSubscriptions() = az "account list"
     let setSubscription subscriptionId = az (sprintf "account set --subscription %s" subscriptionId)
     /// Creates a resource group.
-    let createResourceGroup location resourceGroup =
-        az (sprintf "group create -l %s -n %s" location resourceGroup) |> Result.ignore
+    let createResourceGroup location resourceGroup = az (sprintf "group create -l %s -n %s" location resourceGroup) |> Result.ignore
+    /// Searches for users in AD using the supplied filter.
+    let searchUsers filter = az ("ad user list --filter " + filter)
+    /// Searches for groups in AD using the supplied filter.
+    let searchGroups filter = az ("ad group list --filter " + filter)
+
 
     type DeploymentCommand =
     | Create
@@ -102,12 +117,25 @@ module Az =
     let validate resourceGroup deploymentName templateFilename parameters = deployOrValidate Validate resourceGroup deploymentName templateFilename parameters |> Result.ignore
     // The what-if operation doesn't make any changes to existing resources. Instead, it predicts the changes if the specified template is deployed.
     let whatIf resourceGroup deploymentName templateFilename parameters = deployOrValidate WhatIf resourceGroup deploymentName templateFilename parameters
-    /// Deploys a zip file to a web app using the Zip Deploy mechanism.
-    let zipDeploy webAppName getZipPath resourceGroup =
+    /// Generic function for ZipDeploy using custom command (based on application type)
+    let private zipDeploy command appName getZipPath resourceGroup =
         let packageFilename = getZipPath deployFolder
-        az (sprintf """webapp deployment source config-zip --resource-group "%s" --name "%s" --src %s""" resourceGroup webAppName packageFilename)
+        az (sprintf """%s deployment source config-zip --resource-group "%s" --name "%s" --src %s""" command resourceGroup appName packageFilename)
+    /// Deploys a zip file to a web app using the Zip Deploy mechanism.
+    let zipDeployWebApp = zipDeploy "webapp"
+    /// Deploys a zip file to a function app using the Zip Deploy mechanism.
+    let zipDeployFunctionApp = zipDeploy "functionapp"
     let delete resourceGroup =
         az (sprintf "group delete --name %s --yes --no-wait" resourceGroup)
+    let enableStaticWebsite name indexDoc errorDoc =
+        [ sprintf "storage blob service-properties update --account-name %s --static-website --index-document %s" name indexDoc
+          match errorDoc with
+          | Some errorDoc -> sprintf "--404-document %s" errorDoc
+          | None -> () ]
+        |> String.concat " "
+        |> az
+    let batchUploadStaticWebsite name path =
+        az (sprintf "storage blob upload-batch --account-name %s --destination $web --source %s" name path)
 
 /// Represents an Azure subscription
 type Subscription = { ID : Guid; Name : string; IsDefault : bool }
@@ -123,6 +151,7 @@ let listSubscriptions() = result {
     let! response = Az.listSubscriptions()
     return response |> JsonConvert.DeserializeObject<Subscription array>
 }
+
 
 /// Checks that the version of the Azure CLI meets minimum version.
 let checkVersion minimum = result {
@@ -153,9 +182,13 @@ let setSubscription (subscriptionId:Guid) =
 /// Validates that the parameters supplied meet the deployment requirements.
 let validateParameters suppliedParameters deployment =
     let expected = deployment.Template.Parameters |> List.map(fun (SecureParameter p) -> p) |> Set
-    match (expected - (suppliedParameters |> List.map fst |> Set)) |> Seq.toList with
-    | [] -> Ok ()
-    | missingParameters -> Error (sprintf "The following parameters are missing: %s." (missingParameters |> String.concat ", "))
+    let supplied = suppliedParameters |> List.map fst |> Set
+    let missing = Set.toList (expected - supplied)
+    let extra = Set.toList (supplied - expected)
+    match missing, extra with
+    | [], [] -> Ok ()
+    | (_ :: _), _ -> Error (sprintf "The following parameters are missing: %s. Please add them." (missing |> String.concat ", "))
+    | [], (_ :: _) -> Error (sprintf "The following parameters are not required: %s. Please remove them." (extra |> String.concat ", "))
 
 let NoParameters : (string * string) list = []
 
@@ -167,10 +200,19 @@ let private prepareForDeployment parameters resourceGroupName deployment = resul
 
     prepareDeploymentFolder()
 
-    do!
+    let! subscriptionDetails =
         printf "Checking Azure CLI logged in status... "
-        if Az.isLoggedIn() then printfn "you are already logged in, nothing to do."; Ok()
-        else printfn "logging you in."; Az.login()
+        match Az.showAccount() with
+        | Ok response ->
+            printfn "you are already logged in, nothing to do."
+            Ok response
+        | Error _ ->
+            printfn "logging you in."
+            Az.login()
+            |> Result.bind(fun _ -> Az.showAccount())
+
+    let subscriptionDetails = subscriptionDetails |> JsonConvert.DeserializeObject<{| id : Guid; name : string |}>
+    printfn "Using subscription '%s' (%O)." subscriptionDetails.name subscriptionDetails.id
 
     printfn "Creating resource group %s..." resourceGroupName
     do! Az.createResourceGroup deployment.Location.ArmValue resourceGroupName
@@ -207,7 +249,10 @@ let tryExecute resourceGroupName parameters deployment = result {
         |> Result.ignore
 
     printfn "All done, now parsing ARM response to get any outputs..."
-    let response = response |> JsonConvert.DeserializeObject<{| properties : {| outputs : Map<string, {| value : string |}> |} |}>
+    let! response =
+        response
+        |> Result.ofExn JsonConvert.DeserializeObject<{| properties : {| outputs : Map<string, {| value : string |}> |} |}>
+        |> Result.mapError(fun _ -> response)
     return response.properties.outputs |> Map.map (fun _ value -> value.value)
 }
 
@@ -222,4 +267,3 @@ let whatIf resourceGroupName parameters deployment =
     match tryWhatIf resourceGroupName parameters deployment with
     | Ok output -> output
     | Error message -> failwith message
-

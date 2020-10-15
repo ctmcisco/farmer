@@ -3,85 +3,129 @@ module Farmer.Builders.VirtualMachine
 
 open Farmer
 open Farmer.CoreTypes
+open Farmer.PublicIpAddress
 open Farmer.Vm
 open Farmer.Helpers
 open Farmer.Arm.Compute
 open Farmer.Arm.Network
 open Farmer.Arm.Storage
+open System
 
 let makeName (vmName:ResourceName) elementType = sprintf "%s-%s" vmName.Value elementType
-let makeResourceName vmName = makeName vmName >> ResourceName
 
 type VmConfig =
     { Name : ResourceName
-      DiagnosticsStorageAccount : ResourceRef option
+      DiagnosticsStorageAccount : ResourceRef<VmConfig> option
 
-      Username : string
+      Username : string option
       Image : ImageDefinition
       Size : VMSize
       OsDisk : DiskInfo
       DataDisks : DiskInfo list
 
-      DomainNamePrefix : string option
-      AddressPrefix : string
-      SubnetPrefix : string }
+      CustomScript : string option
+      CustomScriptFiles : Uri list
 
-    member this.NicName = makeResourceName this.Name "nic"
-    member this.VnetName = makeResourceName this.Name "vnet"
-    member this.SubnetName = makeResourceName this.Name "subnet"
-    member this.IpName = makeResourceName this.Name "ip"
-    member this.Hostname = sprintf "reference('%s').dnsSettings.fqdn" this.IpName.Value |> ArmExpression
+      DomainNamePrefix : string option
+
+      VNet : ResourceRef<VmConfig>
+      AddressPrefix : string
+      SubnetPrefix : string
+      Subnet : AutoCreationKind<VmConfig>
+
+      Tags: Map<string,string> }
+
+    member internal this.deriveResourceName = makeName this.Name >> ResourceName
+    member this.NicName = this.deriveResourceName "nic"
+    member this.IpName = this.deriveResourceName "ip"
+    member this.Hostname = sprintf "reference('%s').dnsSettings.fqdn" this.IpName.Value |> ArmExpression.create
+
     interface IBuilder with
-        member this.BuildResources location _ = [
+        member this.DependencyName = this.Name
+        member this.BuildResources location = [
             // VM itself
             { Name = this.Name
               Location = location
               StorageAccount =
                 this.DiagnosticsStorageAccount
-                |> Option.bind(function
-                    | AutomaticPlaceholder -> None
-                    | AutomaticallyCreated r -> Some r
-                    | External r -> Some r)
+                |> Option.map(fun r -> r.CreateResourceId(this).Name)
               NetworkInterfaceName = this.NicName
               Size = this.Size
-              Credentials = {| Username = this.Username; Password = SecureParameter (sprintf "password-for-%s" this.Name.Value) |}
+              Credentials =
+                match this.Username with
+                | Some username ->
+                    {| Username = username
+                       Password = SecureParameter (sprintf "password-for-%s" this.Name.Value) |}
+                | None ->
+                    failwithf "You must specify a username for virtual machine %s" this.Name.Value
               Image = this.Image
               OsDisk = this.OsDisk
-              DataDisks = this.DataDisks }
+              DataDisks = this.DataDisks
+              Tags = this.Tags }
+
+            let vnetName = this.VNet.CreateResourceId(this).Name
+            let subnetName = this.Subnet.CreateResourceName this
 
             // NIC
             { Name = this.NicName
               Location = location
               IpConfigs = [
-                {| SubnetName = this.SubnetName
+                {| SubnetName = subnetName
                    PublicIpName = this.IpName |} ]
-              VirtualNetwork = this.VnetName }
+              VirtualNetwork = vnetName
+              Tags = this.Tags }
 
             // VNET
-            { Name = this.VnetName
-              Location = location
-              AddressSpacePrefixes = [ this.AddressPrefix ]
-              Subnets = [
-                  {| Name = this.SubnetName
-                     Prefix = this.SubnetPrefix |}
-              ] }
+            match this.VNet with
+            | DeployableResource this _ ->
+                { Name = vnetName
+                  Location = location
+                  AddressSpacePrefixes = [ this.AddressPrefix ]
+                  Subnets = [
+                      {| Name = subnetName
+                         Prefix = this.SubnetPrefix
+                         Delegations = [] |}
+                  ]
+                  Tags = this.Tags
+                }
+            | _ ->
+                ()
 
             // IP Address
             { Name = this.IpName
               Location = location
-              DomainNameLabel = this.DomainNamePrefix }
+              AllocationMethod = AllocationMethod.Dynamic
+              Sku = PublicIpAddress.Sku.Basic
+              DomainNameLabel = this.DomainNamePrefix
+              Tags = this.Tags }
 
             // Storage account - optional
             match this.DiagnosticsStorageAccount with
-            | Some (AutomaticallyCreated account) ->
-                { Name = account
+            | Some (DeployableResource this resourceName) ->
+                { Name = Storage.StorageAccountName.Create(resourceName).OkValue
                   Location = location
                   Sku = Storage.Standard_LRS
-                  Containers = [] }
-            | Some AutomaticPlaceholder
-            | Some (External _)
+                  StaticWebsite = None
+                  EnableHierarchicalNamespace = None
+                  Tags = this.Tags }
+            | Some _
             | None ->
                 ()
+
+            // Custom Script - optional
+            match this.CustomScript, this.CustomScriptFiles with
+            | Some script, files ->
+                { Name = this.Name.Map(sprintf "%s-custom-script")
+                  Location = location
+                  VirtualMachine = this.Name
+                  OS = this.Image.OS
+                  ScriptContents = script
+                  FileUris = files
+                  Tags = this.Tags }
+            | None, [] ->
+                ()
+            | None, _ ->
+                failwithf "You have supplied custom script files %A but no script. Custom script files are not automatically executed; you must provide an inline script which acts as a bootstrapper using the custom_script keyword." this.CustomScriptFiles
         ]
 
 type VirtualMachineBuilder() =
@@ -89,30 +133,25 @@ type VirtualMachineBuilder() =
         { Name = ResourceName.Empty
           DiagnosticsStorageAccount = None
           Size = Basic_A0
-          Username = "admin"
+          Username = None
           Image = WindowsServer_2012Datacenter
-          DataDisks = [ ]
+          DataDisks = []
+          CustomScript = None
+          CustomScriptFiles = []
           DomainNamePrefix = None
-          OsDisk = { Size = 128; DiskType = DiskType.Standard_LRS }
+          OsDisk = { Size = 128; DiskType = Standard_LRS }
           AddressPrefix = "10.0.0.0/16"
-          SubnetPrefix = "10.0.0.0/24" }
+          SubnetPrefix = "10.0.0.0/24"
+          VNet = derived (fun config -> config.deriveResourceName "vnet")
+          Subnet = Derived(fun config -> config.deriveResourceName "subnet")
+          Tags = Map.empty }
 
     member __.Run (state:VmConfig) =
         { state with
-            DiagnosticsStorageAccount =
-                state.DiagnosticsStorageAccount
-                |> Option.map(fun account ->
-                    match account with
-                    | AutomaticPlaceholder ->
-                        state.Name
-                        |> sanitiseStorage
-                        |> sprintf "%sstorage"
-                        |> ResourceName
-                        |> AutomaticallyCreated
-                    | External _
-                    | AutomaticallyCreated _ ->
-                        account)
-            DataDisks = match state.DataDisks with [] -> [ { Size = 1024; DiskType = DiskType.Standard_LRS } ] | other -> other
+            DataDisks =
+                match state.DataDisks with
+                | [] -> [ { Size = 1024; DiskType = DiskType.Standard_LRS } ]
+                | other -> other
         }
 
     /// Sets the name of the VM.
@@ -121,7 +160,13 @@ type VirtualMachineBuilder() =
     member this.Name(state:VmConfig, name) = this.Name(state, ResourceName name)
     /// Turns on diagnostics support using an automatically created storage account.
     [<CustomOperation "diagnostics_support">]
-    member __.StorageAccountName(state:VmConfig) = { state with DiagnosticsStorageAccount = Some AutomaticPlaceholder }
+    member __.StorageAccountName(state:VmConfig) =
+        let storageResourceRef = derived (fun config ->
+            config.Name.Map (sprintf "%sstorage")
+            |> sanitiseStorage
+            |> ResourceName)
+
+        { state with DiagnosticsStorageAccount = Some storageResourceRef }
     /// Turns on diagnostics support using an externally managed storage account.
     [<CustomOperation "diagnostics_support_external">]
     member __.StorageAccountNameExternal(state:VmConfig, name) = { state with DiagnosticsStorageAccount = Some (External name) }
@@ -130,13 +175,13 @@ type VirtualMachineBuilder() =
     member __.VmSize(state:VmConfig, size) = { state with Size = size }
     /// Sets the admin username of the VM (note: the password is supplied as a securestring parameter to the generated ARM template).
     [<CustomOperation "username">]
-    member __.Username(state:VmConfig, username) = { state with Username = username }
+    member __.Username(state:VmConfig, username) = { state with Username = Some username }
     /// Sets the operating system of the VM. A set of samples is provided in the `CommonImages` module.
     [<CustomOperation "operating_system">]
     member __.ConfigureOs(state:VmConfig, image) =
         { state with Image = image }
-    member __.ConfigureOs(state:VmConfig, (offer, publisher, sku)) =
-        { state with Image = { Offer = offer; Publisher = publisher; Sku = sku } }
+    member __.ConfigureOs(state:VmConfig, (os, offer, publisher, sku)) =
+        { state with Image = { OS = os; Offer = Offer offer; Publisher = Publisher publisher; Sku = ImageSku sku } }
     /// Sets the size and type of the OS disk for the VM.
     [<CustomOperation "os_disk">]
     member __.OsDisk(state:VmConfig, size, diskType) =
@@ -149,7 +194,7 @@ type VirtualMachineBuilder() =
     member this.AddSsd(state:VmConfig, size) = this.AddDisk(state, size, StandardSSD_LRS)
     /// Adds a conventional (non-SSD) data disk to the VM with a specific size.
     [<CustomOperation "add_slow_disk">]
-    member this.AddSlowDisk(state:VmConfig, size) = this.AddDisk(state, size, DiskType.Standard_LRS)
+    member this.AddSlowDisk(state:VmConfig, size) = this.AddDisk(state, size, Standard_LRS)
     /// Sets the prefix for the domain name of the VM.
     [<CustomOperation "domain_name_prefix">]
     member __.DomainNamePrefix(state:VmConfig, prefix) = { state with DomainNamePrefix = prefix }
@@ -159,5 +204,26 @@ type VirtualMachineBuilder() =
     /// Sets the subnet prefix of the VM.
     [<CustomOperation "subnet_prefix">]
     member __.SubnetPrefix(state:VmConfig, prefix) = { state with SubnetPrefix = prefix }
+    /// Sets the subnet name of the VM.
+    [<CustomOperation "subnet_name">]
+    member __.SubnetName(state:VmConfig, name) = { state with Subnet = Named name }
+    member this.SubnetName(state:VmConfig, name) = this.SubnetName(state, ResourceName name)
+    /// Uses an external VNet instead of creating a new one.
+    [<CustomOperation "link_to_vnet">]
+    member __.LinkToVNet(state:VmConfig, name) = { state with VNet = External (Managed name) }
+    member this.LinkToVNet(state:VmConfig, name) = this.LinkToVNet(state, ResourceName name)
+    member this.LinkToVNet(state:VmConfig, vnet:Arm.Network.VirtualNetwork) = this.LinkToVNet(state, vnet.Name)
+    member this.LinkToVNet(state:VmConfig, vnet:VirtualNetworkConfig) = this.LinkToVNet(state, vnet.Name)
+
+    [<CustomOperation "custom_script">]
+    member _.CustomScript(state:VmConfig, script:string) = { state with CustomScript = Some script }
+    [<CustomOperation "custom_script_files">]
+    member _.CustomScriptFiles(state:VmConfig, uris:string list) = { state with CustomScriptFiles = uris |> List.map Uri }
+    [<CustomOperation "add_tags">]
+    member _.Tags(state:VmConfig, pairs) =
+        { state with
+            Tags = pairs |> List.fold (fun map (key,value) -> Map.add key value map) state.Tags }
+    [<CustomOperation "add_tag">]
+    member this.Tag(state:VmConfig, key, value) = this.Tags(state, [ (key,value) ])
 
 let vm = VirtualMachineBuilder()

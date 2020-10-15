@@ -1,11 +1,14 @@
 [<AutoOpen>]
-module Farmer.Builders.WebApp
+module rec Farmer.Builders.WebApp
 
 open Farmer
 open Farmer.CoreTypes
-open Farmer.Web
+open Farmer.WebApp
 open Farmer.Arm.Web
+open Farmer.Arm.KeyVault.Vaults
 open Farmer.Arm.Insights
+open Sites
+open System
 
 type JavaHost =
     | JavaSE | WildFly14 | Tomcat of string
@@ -15,7 +18,7 @@ type JavaRuntime =
     | Java8 | Java11
     member this.Version = match this with Java8 -> 8 | Java11 -> 11
     member this.Jre = match this with Java8 -> "jre8" | Java11 -> "java11"
-type WebAppRuntime =
+type Runtime =
     | DotNetCore of string
     | Node of string
     | Php of string
@@ -58,56 +61,138 @@ module AppSettings =
     let WebsiteNodeDefaultVersion version = "WEBSITE_NODE_DEFAULT_VERSION", version
     let RunFromPackage = "WEBSITE_RUN_FROM_PACKAGE", "1"
 
-let publishingPassword (ResourceName name) =
-    sprintf "list(resourceId('Microsoft.Web/sites/config', '%s', 'publishingcredentials'), '2014-06-01').properties.publishingPassword" name
-    |> ArmExpression
+let publishingPassword (name:ResourceName) =
+    let resourceId = ResourceId.create(config, name, ResourceName "publishingCredentials")
+    let expr = sprintf "list(%s, '2014-06-01').properties.publishingPassword" resourceId.ArmExpression.Value
+    ArmExpression.create(expr, resourceId)
+
+type SecretStore =
+    | AppService
+    | KeyVault of ResourceRef<WebAppConfig>
 
 type WebAppConfig =
     { Name : ResourceName
-      ServicePlanName : ResourceRef
+      ServicePlan : ResourceRef<WebAppConfig>
       HTTPSOnly : bool
-      AppInsightsName : ResourceRef option
+      HTTP20Enabled : bool option
+      ClientAffinityEnabled : bool option
+      WebSocketsEnabled: bool option
+      AppInsights : ResourceRef<WebAppConfig> option
       OperatingSystem : OS
-      Settings : Map<string, string>
-      Dependencies : ResourceName list
+      Settings : Map<string, Setting>
+      ConnectionStrings : Map<string, (Setting * ConnectionStringKind)>
+      Dependencies : ResourceId list
+      Tags : Map<string,string>
 
+      Cors : Cors option
       Sku : Sku
       WorkerSize : WorkerSize
       WorkerCount : int
       RunFromPackage : bool
       WebsiteNodeDefaultVersion : string option
       AlwaysOn : bool
-      Runtime : WebAppRuntime
+      Runtime : Runtime
+
+      Identity : FeatureFlag option
+
       ZipDeployPath : string option
+      SourceControlSettings : {| Repository : Uri; Branch : string; ContinuousIntegration : FeatureFlag |} option
+
       DockerImage : (string * string) option
       DockerCi : bool
-      DockerAcrCredentials : {| RegistryName : string; Password : SecureParameter |} option }
+      DockerAcrCredentials : {| RegistryName : string; Password : SecureParameter |} option
 
+      SecretStore : SecretStore
+    }
     /// Gets the ARM expression path to the publishing password of this web app.
-    member this.PublishingPassword = publishingPassword this.Name
+    member this.PublishingPassword = publishingPassword (this.Name)
     /// Gets the Service Plan name for this web app.
-    member this.ServicePlan = this.ServicePlanName.ResourceName
+    member this.ServicePlanName = this.ServicePlan.CreateResourceId(this).Name
     /// Gets the App Insights name for this web app, if it exists.
-    member this.AppInsights = this.AppInsightsName |> Option.map (fun ai -> ai.ResourceName)
+    member this.AppInsightsName = this.AppInsights |> Option.map (fun ai -> ai.CreateResourceId(this).Name)
+    /// Gets the system-created managed principal for the web app. It must have been enabled using enable_managed_identity.
+    member this.SystemIdentity =
+        let expr =
+            ArmExpression
+                .create(sprintf "reference(resourceId('Microsoft.Web/sites', '%s'), '2019-08-01', 'full').identity.principalId" this.Name.Value)
+                .WithOwner(this.Name)
+        PrincipalId expr
+    member this.Endpoint =
+        sprintf "%s.azurewebsites.net" this.Name.Value
+
     interface IBuilder with
-        member this.BuildResources location existingResources = [
-            let webApp =
-                { Name = this.Name
-                  Location = location
-                  ServicePlan = this.ServicePlanName.ResourceName
-                  HTTPSOnly = this.HTTPSOnly
-                  AppSettings = [
-                    yield! this.Settings |> Map.toList
+        member this.DependencyName = this.ServicePlanName
+        member this.BuildResources location = [
+            let keyVault, secrets =
+                match this.SecretStore with
+                | KeyVault (DeployableResource this vaultName) ->
+                    let store = keyVault {
+                        name vaultName
+                        add_access_policy (AccessPolicy.create (this.SystemIdentity, [ KeyVault.Secret.Get ]))
+                        add_secrets [
+                            for setting in this.Settings do
+                                match setting.Value with
+                                | LiteralSetting _ ->
+                                    ()
+                                | ParameterSetting _ ->
+                                    SecretConfig.create (setting.Key)
+                                | ExpressionSetting expr ->
+                                    SecretConfig.create (setting.Key, expr)
+                        ]
+                    }
+                    Some store, []
+                | KeyVault (ExternalResource vaultName) ->
+                    let secrets = [
+                        for setting in this.Settings do
+                            let secret =
+                                match setting.Value with
+                                | LiteralSetting _ ->
+                                    None
+                                | ParameterSetting _ ->
+                                    SecretConfig.create (setting.Key) |> Some
+                                | ExpressionSetting expr ->
+                                    SecretConfig.create (setting.Key, expr) |> Some
+                            match secret with
+                            | Some secret ->
+                                { Secret.Name = vaultName.Name/secret.Key
+                                  Value = secret.Value
+                                  ContentType = secret.ContentType
+                                  Enabled = secret.Enabled
+                                  ActivationDate = secret.ActivationDate
+                                  ExpirationDate = secret.ExpirationDate
+                                  Location = location
+                                  Dependencies = vaultName :: secret.Dependencies } :> IArmResource
+                            | None ->
+                                ()
+                    ]
+                    None, secrets
+                | KeyVault _ | AppService ->
+                    None, []
+
+            yield! secrets
+
+            { Name = this.Name
+              Location = location
+              ServicePlan = this.ServicePlanName
+              HTTPSOnly = this.HTTPSOnly
+              HTTP20Enabled = this.HTTP20Enabled
+              ClientAffinityEnabled = this.ClientAffinityEnabled
+              WebSocketsEnabled = this.WebSocketsEnabled
+              Identity = this.Identity
+              Cors = this.Cors
+              Tags = this.Tags
+              ConnectionStrings = this.ConnectionStrings
+              AppSettings =
+                let literalSettings = [
                     if this.RunFromPackage then AppSettings.RunFromPackage
 
                     match this.WebsiteNodeDefaultVersion with
                     | Some v -> AppSettings.WebsiteNodeDefaultVersion v
                     | None -> ()
 
-                    match this.OperatingSystem, this.AppInsightsName with
-                    | Windows, Some (External resourceName)
-                    | Windows, Some (AutomaticallyCreated resourceName) ->
-                        "APPINSIGHTS_INSTRUMENTATIONKEY", instrumentationKey resourceName |> ArmExpression.Eval
+                    match this.OperatingSystem, this.AppInsights with
+                    | Windows, Some resource ->
+                        "APPINSIGHTS_INSTRUMENTATIONKEY", AppInsights.getInstrumentationKey(resource.CreateResourceId this).Eval()
                         "APPINSIGHTS_PROFILERFEATURE_VERSION", "1.0.0"
                         "APPINSIGHTS_SNAPSHOTFEATURE_VERSION", "1.0.0"
                         "ApplicationInsightsAgent_EXTENSION_VERSION", "~2"
@@ -116,139 +201,179 @@ type WebAppConfig =
                         "SnapshotDebugger_EXTENSION_VERSION", "~1"
                         "XDT_MicrosoftApplicationInsights_BaseExtensions", "~1"
                         "XDT_MicrosoftApplicationInsights_Mode", "recommended"
-                    | Windows, Some AutomaticPlaceholder
                     | Windows, None
                     | Linux, _ ->
                         ()
-
                     if this.DockerCi then "DOCKER_ENABLE_CI", "true"
+                ]
 
+                let dockerSettings = [
                     match this.DockerAcrCredentials with
                     | Some credentials ->
-                        "DOCKER_REGISTRY_SERVER_PASSWORD", credentials.Password.AsArmRef.Eval()
-                        "DOCKER_REGISTRY_SERVER_URL", sprintf "https://%s.azurecr.io" credentials.RegistryName
-                        "DOCKER_REGISTRY_SERVER_USERNAME", credentials.RegistryName
-                    | None ->
-                      ()
-                  ]
-                  Kind = [
-                    "app"
-                    match this.OperatingSystem with Linux -> "linux" | Windows -> ()
-                    match this.DockerImage with Some _ -> "container" | _ -> ()
-                  ] |> String.concat ","
-                  Dependencies = [
-                    this.ServicePlanName.ResourceName
-                    yield! this.Dependencies
-                    match this.AppInsightsName with
-                    | Some (AutomaticallyCreated appInsightsName)
-                    | Some (External appInsightsName) ->
-                        appInsightsName
-                    | Some AutomaticPlaceholder
+                        "DOCKER_REGISTRY_SERVER_PASSWORD", ParameterSetting credentials.Password
+                        Setting.AsLiteral ("DOCKER_REGISTRY_SERVER_URL", sprintf "https://%s.azurecr.io" credentials.RegistryName)
+                        Setting.AsLiteral ("DOCKER_REGISTRY_SERVER_USERNAME", credentials.RegistryName)
                     | None ->
                         ()
-                  ]
-                  AlwaysOn = this.AlwaysOn
-                  LinuxFxVersion =
+                ]
+                literalSettings
+                |> List.map Setting.AsLiteral
+                |> List.append dockerSettings
+                |> List.append (
+                    (match this.SecretStore with
+                     | AppService ->
+                         this.Settings
+                     | KeyVault r ->
+                        let name = r.CreateResourceId this
+                        [ for setting in this.Settings do
+                            match setting.Value with
+                            | LiteralSetting _ ->
+                                setting.Key, setting.Value
+                            | ParameterSetting _
+                            | ExpressionSetting _ ->
+                                setting.Key, LiteralSetting (sprintf "@Microsoft.KeyVault(SecretUri=https://%s.vault.azure.net/secrets/%s)" name.Name.Value setting.Key)
+                        ] |> Map.ofList
+                    ) |> Map.toList)
+                |> Map
+              Kind = [
+                "app"
+                match this.OperatingSystem with Linux -> "linux" | Windows -> ()
+                match this.DockerImage with Some _ -> "container" | _ -> ()
+              ] |> String.concat ","
+              Dependencies = [
+                match this.ServicePlan with
+                | DependableResource this resourceName -> ResourceId.create resourceName
+                | _ -> ()
+
+                yield! this.Dependencies
+
+                match this.SecretStore with
+                | AppService ->
+                    for setting in this.Settings do
+                        match setting.Value with
+                        | ExpressionSetting expr ->
+                            match expr.Owner with
+                            | Some owner -> owner
+                            | None -> ()
+                        | ParameterSetting _
+                        | LiteralSetting _ ->
+                            ()
+                | KeyVault _ ->
+                    ()
+
+                match this.AppInsights with
+                | Some (DependableResource this resourceName) -> ResourceId.create resourceName
+                | Some _ | None -> ()
+              ]
+              AlwaysOn = this.AlwaysOn
+              LinuxFxVersion =
+                match this.OperatingSystem with
+                | Windows ->
+                    None
+                | Linux ->
+                    match this.DockerImage with
+                    | Some (image, _) ->
+                        Some ("DOCKER|" + image)
+                    | None ->
+                        match this.Runtime with
+                        | DotNetCore version -> Some ("DOTNETCORE|" + version)
+                        | Node version -> Some ("NODE|" + version)
+                        | Php version -> Some ("PHP|" + version)
+                        | Ruby version -> Some ("RUBY|" + version)
+                        | Java (runtime, JavaSE) -> Some (sprintf "JAVA|%d-%s" runtime.Version runtime.Jre)
+                        | Java (runtime, (Tomcat version)) -> Some (sprintf "TOMCAT|%s-%s" version runtime.Jre)
+                        | Java (Java8, WildFly14) -> Some (sprintf "WILDFLY|14-%s" Java8.Jre)
+                        | Python (linuxVersion, _) -> Some (sprintf "PYTHON|%s" linuxVersion)
+                        | _ -> None
+              NetFrameworkVersion =
+                match this.Runtime with
+                | AspNet version -> Some (sprintf "v%s" version)
+                | _ -> None
+              JavaVersion =
+                match this.Runtime, this.OperatingSystem with
+                | Java (Java11, Tomcat _), Windows -> Some "11"
+                | Java (Java8, Tomcat _), Windows -> Some "1.8"
+                | _ -> None
+              JavaContainer =
+                match this.Runtime, this.OperatingSystem with
+                | Java (_, Tomcat _), Windows -> Some "Tomcat"
+                | _ -> None
+              JavaContainerVersion =
+                match this.Runtime, this.OperatingSystem with
+                | Java (_, Tomcat version), Windows -> Some version
+                | _ -> None
+              PhpVersion =
+                match this.Runtime, this.OperatingSystem with
+                | Php version, Windows -> Some version
+                | _ -> None
+              PythonVersion =
+                match this.Runtime, this.OperatingSystem with
+                | Python (_, windowsVersion), Windows -> Some windowsVersion
+                | _ -> None
+              Metadata =
+                match this.Runtime, this.OperatingSystem with
+                | Java (_, Tomcat _), Windows -> Some "java"
+                | Php _, _ -> Some "php"
+                | Python _, Windows -> Some "python"
+                | DotNetCore _, Windows -> Some "dotnetcore"
+                | AspNet _, _ -> Some "dotnet"
+                | _ -> None
+                |> Option.map(fun stack -> "CURRENT_STACK", stack)
+                |> Option.toList
+              AppCommandLine = this.DockerImage |> Option.map snd
+              ZipDeployPath = this.ZipDeployPath |> Option.map (fun x -> x, ZipDeploy.ZipDeployTarget.WebApp)
+            }
+
+            match keyVault with
+            | Some keyVault ->
+                let builder = keyVault :> IBuilder
+                yield! builder.BuildResources(location)
+            | None ->
+                ()
+
+            match this.SourceControlSettings with
+            | Some settings ->
+                { Website = this.Name
+                  Location = location
+                  Repository = settings.Repository
+                  Branch = settings.Branch
+                  ContinuousIntegration = settings.ContinuousIntegration }
+            | None ->
+                ()
+
+            match this.AppInsights with
+            | Some (DeployableResource this resourceName) ->
+                { Name = resourceName
+                  Location = location
+                  DisableIpMasking = false
+                  SamplingPercentage = 100
+                  LinkedWebsite =
                     match this.OperatingSystem with
-                    | Windows ->
-                        None
-                    | Linux ->
-                        match this.DockerImage with
-                        | Some (image, _) ->
-                            Some ("DOCKER|" + image)
-                        | None ->
-                            match this.Runtime with
-                            | DotNetCore version -> Some ("DOTNETCORE|" + version)
-                            | Node version -> Some ("NODE|" + version)
-                            | Php version -> Some ("PHP|" + version)
-                            | Ruby version -> Some ("RUBY|" + version)
-                            | Java (runtime, JavaSE) -> Some (sprintf "JAVA|%d-%s" runtime.Version runtime.Jre)
-                            | Java (runtime, (Tomcat version)) -> Some (sprintf "TOMCAT|%s-%s" version runtime.Jre)
-                            | Java (Java8, WildFly14) -> Some (sprintf "WILDFLY|14-%s" Java8.Jre)
-                            | Python (linuxVersion, _) -> Some (sprintf "PYTHON|%s" linuxVersion)
-                            | _ -> None
-                  NetFrameworkVersion =
-                    match this.Runtime with
-                    | AspNet version -> Some (sprintf "v%s" version)
-                    | _ -> None
-                  JavaVersion =
-                    match this.Runtime, this.OperatingSystem with
-                    | Java (Java11, Tomcat _), Windows -> Some "11"
-                    | Java (Java8, Tomcat _), Windows -> Some "1.8"
-                    | _ -> None
-                  JavaContainer =
-                    match this.Runtime, this.OperatingSystem with
-                    | Java (_, Tomcat _), Windows -> Some "Tomcat"
-                    | _ -> None
-                  JavaContainerVersion =
-                    match this.Runtime, this.OperatingSystem with
-                    | Java (_, Tomcat version), Windows -> Some version
-                    | _ -> None
-                  PhpVersion =
-                    match this.Runtime, this.OperatingSystem with
-                    | Php version, Windows -> Some version
-                    | _ -> None
-                  PythonVersion =
-                    match this.Runtime, this.OperatingSystem with
-                    | Python (_, windowsVersion), Windows -> Some windowsVersion
-                    | _ -> None
-                  Metadata =
-                    match this.Runtime, this.OperatingSystem with
-                    | Java (_, Tomcat _), Windows -> Some "java"
-                    | Php _, _ -> Some "php"
-                    | Python _, Windows -> Some "python"
-                    | DotNetCore _, Windows -> Some "dotnetcore"
-                    | AspNet _, _ -> Some "dotnet"
-                    | _ -> None
-                    |> Option.map(fun stack -> "CURRENT_STACK", stack)
-                    |> Option.toList
-                  AppCommandLine = this.DockerImage |> Option.map snd
-                  ZipDeployPath = this.ZipDeployPath
-                  Parameters = [
-                      match this.DockerAcrCredentials with
-                      | Some credentials -> credentials.Password
-                      | None -> ()
-                  ]
-                }
+                    | Windows -> Some this.Name
+                    | Linux -> None
+                  Tags = this.Tags }
+            | Some _
+            | None ->
+                ()
 
-            let ai =
-                match this.AppInsightsName with
-                | Some (AutomaticallyCreated resourceName) ->
-                    { Name = resourceName
-                      Location = location
-                      LinkedWebsite =
-                        match this.OperatingSystem with
-                        | Windows -> Some this.Name
-                        | Linux -> None }
-                    |> Some
-                | Some AutomaticPlaceholder
-                | Some (External _)
-                | None ->
-                    None
-
-            let serverFarm =
-                match this.ServicePlanName with
-                | External _
-                | AutomaticPlaceholder ->
-                    None
-                | AutomaticallyCreated name ->
-                    { Name = name
-                      Location = location
-                      Sku = this.Sku
-                      WorkerSize = this.WorkerSize
-                      WorkerCount = this.WorkerCount
-                      OperatingSystem = this.OperatingSystem }
-                    |> Some
-            webApp
-            match ai with Some ai -> ai | None -> ()
-            match serverFarm with Some serverFarm -> serverFarm | None -> ()
+            match this.ServicePlan with
+            | DeployableResource this resourceName ->
+                { Name = resourceName
+                  Location = location
+                  Sku = this.Sku
+                  WorkerSize = this.WorkerSize
+                  WorkerCount = this.WorkerCount
+                  OperatingSystem = this.OperatingSystem
+                  Tags = this.Tags}
+            | _ ->
+                ()
         ]
 
 type WebAppBuilder() =
     member __.Yield _ =
         { Name = ResourceName.Empty
-          ServicePlanName = AutomaticPlaceholder
-          AppInsightsName = Some AutomaticPlaceholder
+          ServicePlan = derived (fun t -> t.Name.Map(sprintf "%s-farm"))
+          AppInsights = Some (derived (fun t -> t.Name.Map(sprintf "%s-ai")))
           Sku = Sku.F1
           WorkerSize = Small
           WorkerCount = 1
@@ -256,29 +381,30 @@ type WebAppBuilder() =
           WebsiteNodeDefaultVersion = None
           AlwaysOn = false
           HTTPSOnly = false
+          HTTP20Enabled = None
+          ClientAffinityEnabled = None
+          WebSocketsEnabled = None
           Settings = Map.empty
+          ConnectionStrings = Map.empty
+          Tags = Map.empty
           Dependencies = []
-          Runtime = WebAppRuntime.DotNetCoreLts
+          Identity = None
+          Runtime = Runtime.DotNetCoreLts
           OperatingSystem = Windows
           ZipDeployPath = None
           DockerImage = None
           DockerCi = false
-          DockerAcrCredentials = None }
+          Cors = None
+          SourceControlSettings = None
+          DockerAcrCredentials = None
+          SecretStore = AppService }
     member __.Run(state:WebAppConfig) =
         let operatingSystem =
             match state.DockerImage with
             | None -> state.OperatingSystem
             | Some _ -> Linux
         { state with
-            ServicePlanName =
-                match state.ServicePlanName with
-                | AutomaticPlaceholder -> AutomaticallyCreated (ResourceName (sprintf "%s-farm" state.Name.Value))
-                | AutomaticallyCreated x -> AutomaticallyCreated x
-                | External r -> External r
-            OperatingSystem =
-                operatingSystem
-            AppInsightsName =
-                tryCreateAppInsightsName state.AppInsightsName state.Name.Value
+            OperatingSystem = operatingSystem
             DockerImage =
                 match state.DockerImage, state.DockerAcrCredentials with
                 | Some (image, tag), Some credentials when not (image.Contains "azurecr.io") ->
@@ -294,15 +420,18 @@ type WebAppBuilder() =
     member this.Name(state:WebAppConfig, name:string) = this.Name(state, ResourceName name)
     /// Sets the name of the service plan.
     [<CustomOperation "service_plan_name">]
-    member _.ServicePlanName(state:WebAppConfig, name) = { state with ServicePlanName = name }
-    member this.ServicePlanName(state:WebAppConfig, name) = this.ServicePlanName(state, AutomaticallyCreated name)
+    member _.ServicePlanName(state:WebAppConfig, name) = { state with ServicePlan = AutoCreate(Named name) }
     member this.ServicePlanName(state:WebAppConfig, name:string) = this.ServicePlanName(state, ResourceName name)
-    /// Do not create a service plan for this web app. Instead, link to another pre-defined one.
+    /// Instead of creating a new service plan instance, configure this webapp to point to another Farmer-managed service plan instance.
+    /// A dependency will automatically be set for this instance.
     [<CustomOperation "link_to_service_plan">]
-    member __.LinkToServicePlan(state:WebAppConfig, name) = { state with ServicePlanName = External name }
+    member __.LinkToServicePlan(state:WebAppConfig, name) = { state with ServicePlan = External (Managed name) }
     member this.LinkToServicePlan(state:WebAppConfig, name:string) = this.LinkToServicePlan (state, ResourceName name)
     member this.LinkToServicePlan(state:WebAppConfig, config:ServicePlanConfig) = this.LinkToServicePlan (state, config.Name)
-    /// Sets the sku of the service plan.
+    /// Instead of creating a new service plan instance, configure this webapp to point to another unmanaged service plan instance.
+    /// A dependency will automatically be set for this instance.
+    [<CustomOperation "link_to_unmanaged_service_plan">]
+    member __.LinkToUnmanagedServicePlan(state:WebAppConfig, resourceId) = { state with ServicePlan = External (Unmanaged resourceId) }
     [<CustomOperation "sku">]
     member __.Sku(state:WebAppConfig, sku) = { state with Sku = sku }
     /// Sets the size of the service plan worker.
@@ -312,18 +441,23 @@ type WebAppBuilder() =
     [<CustomOperation "number_of_workers">]
     member __.NumberOfWorkers(state:WebAppConfig, workerCount) = { state with WorkerCount = workerCount }
     /// Sets the name of the automatically-created app insights instance.
-    [<CustomOperation "app_insights_auto_name">]
-    member __.UseAppInsights(state:WebAppConfig, name) = { state with AppInsightsName = Some (AutomaticallyCreated name) }
+    [<CustomOperation "app_insights_name">]
+    member __.UseAppInsights(state:WebAppConfig, name) = { state with AppInsights = Some (AutoCreate (Named name)) }
     member this.UseAppInsights(state:WebAppConfig, name:string) = this.UseAppInsights(state, ResourceName name)
     /// Removes any automatic app insights creation, configuration and settings for this webapp.
     [<CustomOperation "app_insights_off">]
-    member __.DeactivateAppInsights(state:WebAppConfig) = { state with AppInsightsName = None }
-    /// Instead of creating a new AI instance, configure this webapp to point to another AI instance that you are managing
-    /// yourself.
+    member __.DeactivateAppInsights(state:WebAppConfig) = { state with AppInsights = None }
+    /// Instead of creating a new AI instance, configure this webapp to point to another Farmer-managed AI instance.
+    /// A dependency will automatically be set for this instance.
     [<CustomOperation "link_to_app_insights">]
-    member __.LinkAppInsights(state:WebAppConfig, name) = { state with AppInsightsName = Some(External name) }
-    member this.LinkAppInsights(state:WebAppConfig, name) = this.LinkAppInsights(state, ResourceName name)
-    member __.LinkAppInsights(state:WebAppConfig, name) = { state with AppInsightsName = name |> Option.map External }
+    member __.LinkToAi(state:WebAppConfig, name) = { state with AppInsights = Some(External (Managed name)) }
+    member this.LinkToAi(state:WebAppConfig, name) = this.LinkToAi (state, ResourceName name)
+    member this.LinkToAi(state:WebAppConfig, name:ResourceName option) = match name with Some name -> this.LinkToAi (state, name) | None -> state
+    member this.LinkToAi(state:WebAppConfig, config:AppInsightsConfig) = this.LinkToAi (state, config.Name)
+    /// Instead of creating a new AI instance, configure this webapp to point to an unmanaged AI instance.
+    /// A dependency will not be set for this instance.
+    [<CustomOperation "link_to_unmanaged_app_insights">]
+    member __.LinkUnmanagedAppInsights(state:WebAppConfig, resourceId) = { state with AppInsights = Some(External(Unmanaged resourceId)) }
     /// Sets the web app to use "run from package" deployment capabilities.
     [<CustomOperation "run_from_package">]
     member __.RunFromPackage(state:WebAppConfig) = { state with RunFromPackage = true }
@@ -332,22 +466,57 @@ type WebAppBuilder() =
     member __.NodeVersion(state:WebAppConfig, version) = { state with WebsiteNodeDefaultVersion = Some version }
     /// Sets an app setting of the web app in the form "key" "value".
     [<CustomOperation "setting">]
-    member __.AddSetting(state:WebAppConfig, key, value) = { state with Settings = state.Settings.Add(key, value) }
-    member __.AddSetting(state:WebAppConfig, key, value:ArmExpression) = { state with Settings = state.Settings.Add(key, value.Eval()) }
+    member __.AddSetting(state:WebAppConfig, key, value) =
+        { state with Settings = state.Settings.Add(key, LiteralSetting value) }
+    member this.AddSetting(state:WebAppConfig, key, resourceName:ResourceName) = this.AddSetting(state, key, resourceName.Value)
+    member _.AddSetting(state:WebAppConfig, key, value:ArmExpression) =
+        { state with Settings = state.Settings.Add(key, ExpressionSetting value) }
     /// Sets a list of app setting of the web app in the form "key" "value".
     [<CustomOperation "settings">]
-    member __.AddSettings(state:WebAppConfig, settings: (string*string) list) =
+    member this.AddSettings(state:WebAppConfig, settings: (string*string) list) =
         settings
-        |> List.fold (fun state (key, value: string) -> __.AddSetting(state, key, value)) state
+        |> List.fold (fun state (key, value: string) -> this.AddSetting(state, key, value)) state
+    /// Creates an app setting of the web app whose value will be supplied as a secret parameter.
+    [<CustomOperation "secret_setting">]
+    member __.AddSecret(state:WebAppConfig, key) =
+        { state with Settings = state.Settings.Add(key, ParameterSetting (SecureParameter key)) }
+    /// Creates a set of connection strings of the web app whose values will be supplied as secret parameters.
+    [<CustomOperation "connection_string">]
+    member _.AddConnectionString(state:WebAppConfig, key) =
+        { state with ConnectionStrings = state.ConnectionStrings.Add(key, (ParameterSetting (SecureParameter key), Custom)) }
+    member _.AddConnectionString(state:WebAppConfig, (key, value:ArmExpression)) =
+        { state with ConnectionStrings = state.ConnectionStrings.Add(key, (ExpressionSetting value, Custom)) }
+    /// Creates a set of connection strings of the web app whose values will be supplied as secret parameters.
+    [<CustomOperation "connection_strings">]
+    member this.AddConnectionStrings(state:WebAppConfig, connectionStrings) =
+        connectionStrings
+        |> List.fold (fun (state:WebAppConfig) (key:string) -> this.AddConnectionString(state, key)) state
+    member private _.AddDependency (state:WebAppConfig, resourceName:ResourceName) = { state with Dependencies = ResourceId.create resourceName :: state.Dependencies }
+    member private _.AddDependencies (state:WebAppConfig, resourceNames:ResourceName list) = { state with Dependencies = (resourceNames |> List.map ResourceId.create) @ state.Dependencies }
     /// Sets a dependency for the web app.
     [<CustomOperation "depends_on">]
-    member __.DependsOn(state:WebAppConfig, resourceName) = { state with Dependencies = resourceName :: state.Dependencies }
+    member this.DependsOn(state:WebAppConfig, resourceName) = this.AddDependency(state, resourceName)
+    member this.DependsOn(state:WebAppConfig, resources) = this.AddDependencies(state, resources)
+    member this.DependsOn(state:WebAppConfig, builder:IBuilder) = this.AddDependency(state, builder.DependencyName)
+    member this.DependsOn(state:WebAppConfig, builders:IBuilder list) = this.AddDependencies(state, builders |> List.map (fun x -> x.DependencyName))
+    member this.DependsOn(state:WebAppConfig, resource:IArmResource) = this.AddDependency(state, resource.ResourceName)
+    member this.DependsOn(state:WebAppConfig, resources:IArmResource list) = this.AddDependencies(state, resources |> List.map (fun x -> x.ResourceName))
+
     /// Sets "Always On" flag
     [<CustomOperation "always_on">]
     member __.AlwaysOn(state:WebAppConfig) = { state with AlwaysOn = true }
     /// Disables http for this webapp so that only https is used.
     [<CustomOperation "https_only">]
     member __.HttpsOnly(state:WebAppConfig) = { state with HTTPSOnly = true }
+    /// Enables HTTP 2.0 for this webapp.
+    [<CustomOperation "enable_http2">]
+    member __.Http20Enabled(state:WebAppConfig) = { state with HTTP20Enabled = Some true }
+    /// Disables client affinity for this webapp.
+    [<CustomOperation "disable_client_affinity">]
+    member __.ClientAffinityEnabled(state:WebAppConfig) = { state with ClientAffinityEnabled = Some false }
+    /// Enables websockets for this webapp.
+    [<CustomOperation "enable_websockets">]
+    member __.WebSockets(state:WebAppConfig) = { state with WebSocketsEnabled = Some true }
     /// Sets the runtime stack
     [<CustomOperation "runtime_stack">]
     member __.RuntimeStack(state:WebAppConfig, runtime) = { state with Runtime = runtime }
@@ -370,5 +539,71 @@ type WebAppBuilder() =
             DockerAcrCredentials =
                 Some {| RegistryName = registryName
                         Password = SecureParameter (sprintf "docker-password-for-%s" registryName) |} }
+    [<CustomOperation "enable_managed_identity">]
+    member _.EnableManagedIdentity(state:WebAppConfig) =
+        { state with Identity = Some Enabled }
+    [<CustomOperation "disable_managed_identity">]
+    member _.DisableManagedIdentity(state:WebAppConfig) =
+        { state with Identity = Some Disabled }
+    /// sets the list of origins that should be allowed to make cross-origin calls. Use AllOrigins to allow all.
+    [<CustomOperation "enable_cors">]
+    member _.EnableCors (state:WebAppConfig, origins) =
+        { state with
+            Cors =
+                match origins with
+                | [ "*" ] -> Some AllOrigins
+                | origins -> Some (SpecificOrigins (List.map Uri origins, None))
+        }
+    member _.EnableCors (state:WebAppConfig, origins) = { state with Cors = Some origins }
+    /// Allows CORS requests with credentials.
+    [<CustomOperation "enable_cors_credentials">]
+    member _.EnableCorsCredentials (state:WebAppConfig) =
+        { state with
+            Cors =
+                state.Cors
+                |> Option.map (function
+                | SpecificOrigins (origins, _) -> SpecificOrigins (origins, Some true)
+                | AllOrigins -> failwith "You cannot enable CORS Credentials if you have already set CORS to AllOrigins.")
+        }
+    [<CustomOperation "source_control">]
+    member _.SourceControl(state:WebAppConfig, url, branch) =
+        { state with
+            SourceControlSettings =
+                Some {| Repository = Uri url
+                        Branch = branch
+                        ContinuousIntegration = Enabled |} }
+    member _.SourceControlCi(state:WebAppConfig, featureFlag) =
+        { state with
+            SourceControlSettings =
+                state.SourceControlSettings
+                |> Option.map(fun s -> {| s with ContinuousIntegration = featureFlag |}) }
+    [<CustomOperation "enable_source_control_ci">]
+    member this.EnableCi(state:WebAppConfig) = this.SourceControlCi(state, Enabled)
+    [<CustomOperation "disable_source_control_ci">]
+    member this.DisableCi(state:WebAppConfig) = this.SourceControlCi(state, Disabled)
+    [<CustomOperation "add_tags">]
+    member _.Tags(state:WebAppConfig, pairs) =
+        { state with
+            Tags = pairs |> List.fold (fun map (key,value) -> Map.add key value map) state.Tags }
+    [<CustomOperation "add_tag">]
+    member this.Tag(state:WebAppConfig, key, value) = this.Tags(state, [ (key,value) ])
+    [<CustomOperation "use_keyvault">]
+    member this.UseKeyVault(state:WebAppConfig) =
+        let state = this.EnableManagedIdentity state
+        { state with SecretStore = KeyVault (derived(fun c -> ResourceName (c.Name.Value + "vault"))) }
+    [<CustomOperation "use_managed_keyvault">]
+    member this.LinkToKeyVault(state:WebAppConfig, name) =
+        let state = this.EnableManagedIdentity state
+        { state with SecretStore = KeyVault (External(Managed name)) }
+    [<CustomOperation "use_external_keyvault">]
+    member this.LinkToExternalKeyVault(state:WebAppConfig, name) =
+        let state = this.EnableManagedIdentity state
+        { state with SecretStore = KeyVault (External(Unmanaged name)) }
 
 let webApp = WebAppBuilder()
+
+/// Allow adding storage accounts directly to CDNs
+type EndpointBuilder with
+    member this.Origin(state:EndpointConfig, webApp:WebAppConfig) =
+        let state = this.Origin(state, webApp.Endpoint)
+        this.DependsOn(state, webApp.Name)

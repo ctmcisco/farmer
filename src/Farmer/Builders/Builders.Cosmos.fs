@@ -8,54 +8,84 @@ open Farmer.Arm.DocumentDb
 open DatabaseAccounts
 open SqlDatabases
 
+type KeyType = PrimaryKey | SecondaryKey member this.ArmValue = match this with PrimaryKey -> "primary" | SecondaryKey -> "secondary"
+type KeyAccess = ReadWrite | ReadOnly member this.ArmValue = match this with ReadWrite -> "" | ReadOnly -> "readonly"
+type ConnectionStringKind = PrimaryConnectionString | SecondaryConnectionString member this.KeyIndex = match this with PrimaryConnectionString -> 0 | SecondaryConnectionString -> 1
+
+type CosmosDb =
+    static member private providerPath = "providers('Microsoft.DocumentDb','databaseAccounts').apiVersions[0]"
+    static member getKey (resourceId:ResourceId, keyType:KeyType, keyAccess:KeyAccess) =
+        let resourceId = resourceId.WithType(databaseAccounts)
+        let expr = sprintf "listKeys(%s, %s).%s%sMasterKey" resourceId.ArmExpression.Value CosmosDb.providerPath keyType.ArmValue keyAccess.ArmValue
+        ArmExpression.create(expr).WithOwner(resourceId)
+    static member getKey (name:ResourceName, keyType, keyAccess) = CosmosDb.getKey(ResourceId.create name, keyType, keyAccess)
+    static member getConnectionString (resourceId:ResourceId, connectionStringKind:ConnectionStringKind) =
+        let resourceId = resourceId.WithType(databaseAccounts)
+        let expr = sprintf "listConnectionStrings(%s, %s).connectionStrings[%i].connectionString" resourceId.ArmExpression.Value CosmosDb.providerPath connectionStringKind.KeyIndex
+        ArmExpression.create(expr).WithOwner(resourceId)
+    static member getConnectionString (name:ResourceName, connectionStringKind) = CosmosDb.getConnectionString (ResourceId.create name, connectionStringKind)
+
 type CosmosDbContainerConfig =
     { Name : ResourceName
       PartitionKey : string list * IndexKind
       Indexes : (string * (IndexDataType * IndexKind) list) list
+      UniqueKeys : Set<string list>
       ExcludedPaths : string list }
 type CosmosDbConfig =
-    { ServerName : ResourceRef
+    { AccountName : ResourceRef<CosmosDbConfig>
       AccountConsistencyPolicy : ConsistencyPolicy
       AccountFailoverPolicy : FailoverPolicy
-      Name : ResourceName
-      DbThroughput : int
+      DbName : ResourceName
+      DbThroughput : int<RU>
       Containers : CosmosDbContainerConfig list
       PublicNetworkAccess : FeatureFlag
-      FreeTier : bool }
-    member this.PrimaryKey =
-        sprintf "[listKeys(resourceId('Microsoft.DocumentDB/databaseAccounts', '%s'), providers('Microsoft.DocumentDB','databaseAccounts').apiVersions[0]).primaryMasterKey]"
-            this.ServerName.ResourceName.Value
+      FreeTier : bool
+      Tags: Map<string,string> }
+    member private this.AccountResourceId = this.AccountName.CreateResourceId(this).WithType(databaseAccounts)
+    member this.PrimaryKey = CosmosDb.getKey(this.AccountResourceId, PrimaryKey, ReadWrite)
+    member this.SecondaryKey = CosmosDb.getKey(this.AccountResourceId, SecondaryKey, ReadWrite)
+    member this.PrimaryReadonlyKey = CosmosDb.getKey(this.AccountResourceId, PrimaryKey, ReadOnly)
+    member this.SecondaryReadonlyKey = CosmosDb.getKey(this.AccountResourceId, SecondaryKey, ReadOnly)
+    member this.PrimaryConnectionString = CosmosDb.getConnectionString(this.AccountResourceId, PrimaryConnectionString)
+    member this.SecondaryConnectionString = CosmosDb.getConnectionString(this.AccountResourceId, SecondaryConnectionString)
     member this.Endpoint =
-        sprintf "[reference(concat('Microsoft.DocumentDb/databaseAccounts/', '%s')).documentEndpoint]" this.ServerName.ResourceName.Value
+        ArmExpression
+            .reference(databaseAccounts, this.AccountResourceId)
+            .Map(sprintf "%s.documentEndpoint")
     interface IBuilder with
-        member this.BuildResources location _ = [
+        member this.DependencyName = this.AccountResourceId.Name
+        member this.BuildResources location = [
             // Account
-            match this.ServerName with
-            | AutomaticallyCreated name ->
-                { Name = name
+            match this.AccountName with
+            | DeployableResource this _ ->
+                { Name = this.AccountResourceId.Name
                   Location = location
                   ConsistencyPolicy = this.AccountConsistencyPolicy
                   PublicNetworkAccess = this.PublicNetworkAccess
                   FailoverPolicy = this.AccountFailoverPolicy
-                  FreeTier = this.FreeTier }
-            | AutomaticPlaceholder ->
-                failwith "No CosmosDB server was specified."
-            | External _ ->
+                  FreeTier = this.FreeTier
+                  Tags = this.Tags }
+            | _ ->
                 ()
 
             // Database
-            { Name = this.Name
-              Account = this.ServerName.ResourceName
+            { Name = this.DbName
+              Account = this.AccountResourceId.Name
               Throughput = this.DbThroughput }
 
             // Containers
             for container in this.Containers do
                 { Name = container.Name
-                  Account = this.ServerName.ResourceName
-                  Database = this.Name
+                  Account = this.AccountResourceId.Name
+                  Database = this.DbName
                   PartitionKey =
                     {| Paths = fst container.PartitionKey
                        Kind = snd container.PartitionKey |}
+                  UniqueKeyPolicy =
+                    {| UniqueKeys =
+                        container.UniqueKeys
+                        |> Set.map (fun uniqueKeyPath -> {| Paths = uniqueKeyPath |})
+                    |}
                   IndexingPolicy =
                     {| ExcludedPaths = container.ExcludedPaths
                        IncludedPaths = [
@@ -67,13 +97,23 @@ type CosmosDbConfig =
                 }
         ]
 
-
 type CosmosDbContainerBuilder() =
     member __.Yield _ =
         { Name = ResourceName ""
           PartitionKey = [], Hash
           Indexes = []
+          UniqueKeys = Set.empty
           ExcludedPaths = [] }
+    member _.Run state =
+        match state.PartitionKey with
+        | [], _ -> failwithf "You must set a partition key on CosmosDB container '%s'." state.Name.Value
+        | partitions, indexKind ->
+            { state with
+                PartitionKey =
+                    [ for partition in partitions do
+                        if partition.StartsWith "/" then partition
+                        else "/" + partition
+                    ], indexKind }
 
     /// Sets the name of the container.
     [<CustomOperation "name">]
@@ -90,37 +130,43 @@ type CosmosDbContainerBuilder() =
     member __.AddIndex (state:CosmosDbContainerConfig, path, indexes) =
         { state with Indexes = (path, indexes) :: state.Indexes }
 
+    /// Adds a unique key constraint to the container (ensures uniqueness within the logical partition).
+    [<CustomOperation "add_unique_key">]
+    member __.AddUniqueKey (state:CosmosDbContainerConfig, uniqueKeyPaths) =
+        { state with UniqueKeys = state.UniqueKeys.Add(uniqueKeyPaths) }
+
     /// Excludes a path from the container index.
     [<CustomOperation "exclude_path">]
     member __.ExcludePath (state:CosmosDbContainerConfig, path) =
         { state with ExcludedPaths = path :: state.ExcludedPaths }
 type CosmosDbBuilder() =
     member __.Yield _ =
-        { Name = ResourceName.Empty
-          ServerName = AutomaticPlaceholder
+        { DbName = ResourceName.Empty
+          AccountName = derived (fun config ->
+            let dbNamePart =
+                let maxLength = 36
+                let dbName = config.DbName.Value.ToLower()
+                if config.DbName.Value.Length > maxLength then dbName.Substring maxLength
+                else dbName
+            ResourceName (sprintf "%s-account" dbNamePart))
           AccountConsistencyPolicy = Eventual
           AccountFailoverPolicy = NoFailover
-          DbThroughput = 400
+          DbThroughput = 400<RU>
           Containers = []
           PublicNetworkAccess = Enabled
-          FreeTier = false }
-    member __.Run state =
-        match state.ServerName with
-        | AutomaticallyCreated _
-        | External _ ->
-            state
-        | AutomaticPlaceholder ->
-            { state with ServerName = sprintf "%s-server" state.Name.Value |> ResourceName |> AutomaticallyCreated }
+          FreeTier = false
+          Tags = Map.empty }
+
     /// Sets the name of the CosmosDB server.
     [<CustomOperation "account_name">]
-    member __.AccountName(state:CosmosDbConfig, serverName) = { state with ServerName = AutomaticallyCreated serverName }
-    member this.AccountName(state:CosmosDbConfig, serverName:string) = this.AccountName(state, ResourceName serverName)
+    member __.AccountName(state:CosmosDbConfig, serverName) = { state with AccountName = AutoCreate (Named serverName) }
+    member this.AccountName(state:CosmosDbConfig, serverName) = this.AccountName(state, ResourceName serverName)
     /// Links the database to an existing server
     [<CustomOperation "link_to_account">]
-    member __.LinkToAccount(state:CosmosDbConfig, server:CosmosDbConfig) = { state with ServerName = External server.ServerName.ResourceName }
+    member __.LinkToAccount(state:CosmosDbConfig, server:CosmosDbConfig) = { state with AccountName = External(Managed(server.AccountName.CreateResourceId(server).Name)) }
     /// Sets the name of the database.
     [<CustomOperation "name">]
-    member __.Name(state:CosmosDbConfig, name) = { state with Name = name }
+    member __.Name(state:CosmosDbConfig, name) = { state with DbName = name }
     member this.Name(state:CosmosDbConfig, name:string) = this.Name(state, ResourceName name)
     /// Sets the consistency policy of the database.
     [<CustomOperation "consistency_policy">]
@@ -143,14 +189,12 @@ type CosmosDbBuilder() =
     /// Enables the use of CosmosDB free tier (one per subscription).
     [<CustomOperation "free_tier">]
     member __.FreeTier(state:CosmosDbConfig) = { state with FreeTier = true }
-
-open WebApp
-type WebAppBuilder with
-    member this.DependsOn(state:WebAppConfig, cosmosDbConfig:CosmosDbConfig) =
-        this.DependsOn(state, cosmosDbConfig.Name)
-type FunctionsBuilder with
-    member this.DependsOn(state:FunctionsConfig, cosmosDbConfig:CosmosDbConfig) =
-        this.DependsOn(state, cosmosDbConfig.Name)
+    [<CustomOperation "add_tags">]
+    member _.Tags(state:CosmosDbConfig, pairs) =
+        { state with
+            Tags = pairs |> List.fold (fun map (key,value) -> Map.add key value map) state.Tags }
+    [<CustomOperation "add_tag">]
+    member this.Tag(state:CosmosDbConfig, key, value) = this.Tags(state, [ (key,value) ])
 
 let cosmosDb = CosmosDbBuilder()
 let cosmosContainer = CosmosDbContainerBuilder()
